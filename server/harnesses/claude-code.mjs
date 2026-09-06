@@ -241,12 +241,34 @@ function mergeThread(existing, next) {
  * id looks like.
  */
 function toThread(t) {
-  const { desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId, titled, hasLiveProcess, ...rest } = t
+  const {
+    desktopSessionId,
+    desktopSessionIds,
+    cliSessionId,
+    bridgeSessionId,
+    titled,
+    hasLiveProcess,
+    transcriptFile,
+    recordActivityAt,
+    parentDesktopId,
+    parentCliId,
+    ...rest
+  } = t
+  const openable = (desktop, cli) => Boolean((desktop && DESKTOP_ID.test(desktop)) || (cli && UUID.test(cli)))
   return {
     ...rest,
-    canOpen: Boolean((desktopSessionId && DESKTOP_ID.test(desktopSessionId)) || (cliSessionId && UUID.test(cliSessionId))),
-    canArchive: desktopSessionIds.length > 0,
+    // A subagent opens its parent — there is no session of its own to resume — and cannot be
+    // archived at all: it has no record to flag, and it is not yours to retire. The thread
+    // that spawned it owns its lifetime, and archiving that takes its workers with it.
+    canOpen: t.subagent ? openable(parentDesktopId, parentCliId) : openable(desktopSessionId, cliSessionId),
+    // Every real thread can be retired, including one the desktop app has never heard of:
+    // a terminal-only session has no record to flag, so archiving it is recorded in the
+    // colony alone — which is the whole reason the colony keeps a list of its own.
+    canArchive: !t.subagent,
     ref: { desktopSessionId, desktopSessionIds, cliSessionId },
+    ...(t.subagent
+      ? { parentRef: { desktopSessionId: parentDesktopId || '', desktopSessionIds: [], cliSessionId: parentCliId || '' } }
+      : {}),
   }
 }
 
@@ -256,6 +278,7 @@ async function scanThreads() {
     scanTranscripts(),
     scanLiveSessions(),
   ])
+  const subagents = await scanSubagentTranscripts()
   const byId = new Map()
   const add = (thread) => {
     const existing = byId.get(thread.id)
@@ -336,17 +359,117 @@ async function scanThreads() {
       archived: false,
       hasTranscript: true,
       sizeBytes: entry.size,
+      transcriptFile: entry.file,
       source: 'cli',
     })
   }
 
-  const threads = [...byId.values()]
+  // Subagents. One per `Agent` call the parent made, standing on the parent's own zone —
+  // see `zonesFor`. They are read-only: there is no session to reopen and nothing to archive,
+  // since the thing that owns them is the thread that spawned them.
+  for (const [id, entry] of subagents) {
+    const meta = await transcriptMeta(entry)
+    const cwd = meta.cwd || decodeProjectDir(path.basename(entry.projectDir))
+    const { projectPath, project, worktree } = projectOf(cwd, '')
+    add({
+      id,
+      cliSessionId: '',
+      desktopSessionId: '',
+      desktopSessionIds: [],
+      titled: false,
+      bridgeSessionId: '',
+      title: meta.firstPrompt ? meta.firstPrompt.slice(0, 90) : 'Subagent',
+      preview: meta.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
+      project,
+      projectPath,
+      worktree,
+      cwd,
+      gitBranch: meta.gitBranch,
+      model: meta.model || '',
+      effort: '',
+      createdAt: meta.startedAt || entry.mtime,
+      lastActivityAt: entry.mtime,
+      lastFocusedAt: 0,
+      // A subagent has no entry in the live registry — it runs inside its parent's process,
+      // so the parent being alive is what makes it capable of running at all.
+      hasLiveProcess: live.has(entry.parentId),
+      hasError: false,
+      starred: false,
+      routine: '',
+      prState: '',
+      archived: false,
+      hasTranscript: true,
+      sizeBytes: entry.size,
+      transcriptFile: entry.file,
+      source: 'subagent',
+      subagent: true,
+      parentId: entry.parentId,
+    })
+  }
+
+  /**
+   * A subagent stands where its *parent* does.
+   *
+   * Its transcript knows only the directory it ran in, and that is routinely not the repo:
+   * `/fix` works inside a scratch worktree, a triage run works out of a state folder. Taking
+   * the basename of that gives a project nobody has ever heard of — `sentry-bc-withdraw-…`
+   * beside `withdraw-bc`, `.triage` beside `PycharmProjects` — so the fan-out lands on a zone
+   * of its own next to the thread that spawned it, which is precisely the thing worth seeing
+   * broken in two. The parent knows better: the desktop record carries the repo it was opened
+   * against, whatever directory the work wandered into.
+   */
+  for (const thread of byId.values()) {
+    if (!thread.subagent) continue
+    const parent = byId.get(thread.parentId)
+    if (!parent) continue
+    thread.project = parent.project
+    thread.projectPath = parent.projectPath
+    thread.worktree = parent.worktree
+    // What "open" means for a worker: the thread that spawned it. Kept apart from the
+    // subagent's own (empty) `ref` on purpose — that ref is what archiving writes through,
+    // and pointing it at the parent would archive the parent from a click on its worker.
+    thread.parentDesktopId = parent.desktopSessionId || ''
+    thread.parentCliId = parent.cliSessionId || ''
+  }
+
+  const now = Date.now()
+  /**
+   * Drop the app's empty bookkeeping records.
+   *
+   * Resuming a thread makes the desktop app write a second record for the same
+   * conversation, and one of those two carries the title and the transcript link while the
+   * other carries nothing. When the empty one has no `cliSessionId` there is no key to
+   * merge the pair on, so it survives as a thread of its own: an untitled entry with no
+   * transcript behind it. Archiving the real thread does not touch it — the ids in `ref`
+   * are the ones the real record named — so an archived conversation appears to come back
+   * as a nameless twin, which is exactly what it looks like from the colony.
+   *
+   * A record with no transcript, no title and no live process is not a conversation. The
+   * age check is what keeps a genuinely new session — opened seconds ago, nothing written
+   * yet — from being swept up with them.
+   */
+  const NEW_SESSION_MS = 10 * 60 * 1000
+  const threads = [...byId.values()].filter(
+    (t) =>
+      t.hasTranscript ||
+      t.titled ||
+      t.hasLiveProcess ||
+      now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS
+  )
   // Unread = the thread moved on after you last looked at it; never opened counts as unread.
   // Terminal-only threads have no focus history at all, so "unread" is unknowable — not true.
-  const now = Date.now()
   for (const thread of threads) {
-    thread.unread = thread.desktopSessionIds.length > 0 && thread.lastActivityAt > thread.lastFocusedAt
-    thread.running = thread.hasLiveProcess && now - thread.lastActivityAt < ACTIVE_WINDOW_MS
+    const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
+    thread.unread = thread.desktopSessionIds.length > 0 && seenAt > thread.lastFocusedAt
+    const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
+    // Only threads that could plausibly be working pay for the tail read.
+    const waiting =
+      thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
+    thread.running = thread.hasLiveProcess && fresh && !waiting
+    // A thread that handed the turn back wants you, whether or not the desktop app has ever
+    // seen it — which is the only way a terminal-only thread can ask for anything at all.
+    // A subagent cannot: nobody replies to a worker, it simply stops.
+    if (waiting && !thread.subagent) thread.unread = true
   }
   return threads.map(toThread)
 }

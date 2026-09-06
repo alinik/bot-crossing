@@ -387,6 +387,10 @@ export class Colony {
           id: thread.id,
           thread,
           status,
+          // Drawn in a different suit — see `SUBAGENT_SUIT`. A fan-out is a crowd of them
+          // around one building, and that only reads if they are told apart from the thread
+          // that spawned them.
+          subagent: Boolean(thread.subagent),
           site: this._workSite(plot, building, i),
           // Where the work actually is. A working astronaut circles it rather than standing
           // at one spot, so it needs the building, not just a place to stand near it.

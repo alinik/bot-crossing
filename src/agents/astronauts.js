@@ -503,7 +503,9 @@ export class Astronauts {
       faceFrame: FACE.boot,
       faceTimer: 0,
       faceIndex: 0,
-      suit: SUIT_TONES[(hash(entry.id) >>> 3) % SUIT_TONES.length],
+      subagent: Boolean(entry.subagent),
+      suit: entry.subagent ? SUBAGENT_SUIT : SUIT_TONES[(hash(entry.id) >>> 3) % SUIT_TONES.length],
+      helmet: 0xffffff, // set from the model a line below, once `suit` exists to fall back to
       eye: new THREE.Color(1, 1, 1),
       trim: new THREE.Color(0xffffff),
       hop: 0,

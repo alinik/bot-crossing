@@ -561,9 +561,18 @@ export class Hud {
       `<span class="tag"><i class="swatch" style="background:${hex(agent.trim.getHex())}"></i>${escapeHtml(status)}</span>`,
     ]
     // The repo is the panel's own heading now, so the card says what the *thread* is.
+    // A yellow astronaut is somebody else's worker: say so, since there is nothing to open.
+    if (thread.subagent) bits.push('<span class="tag">↳ subagent</span>')
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
-    if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
+    // The swatch is the helmet the astronaut is actually wearing, so the card explains the
+    // colour rather than repeating the name in a second place.
+    if (thread.model) {
+      const tint = hex(helmetFor(thread.model, 0x8b8b85))
+      bits.push(
+        `<span class="tag"><i class="swatch" style="background:${tint}"></i>${escapeHtml(shortModel(thread.model))}</span>`
+      )
+    }
     bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
     meta.innerHTML = bits.join('')
 
@@ -574,7 +583,18 @@ export class Hud {
     // astronaut needs its size sixty times a second, and asking the layout for it that
     // often is how a HUD starts costing frames.
     this._cardSize = { w: card.offsetWidth, h: card.offsetHeight }
-    this.$('#btn-open').disabled = thread.canOpen === false
+    const open = this.$('#btn-open')
+    open.disabled = thread.canOpen === false
+    // A worker has no session of its own, so say where the button actually goes.
+    open.innerHTML = `${ICON.open} ${thread.subagent ? 'Open parent' : 'Open'}`
+    open.title = thread.subagent
+      ? 'Open the thread that spawned this worker (Enter)'
+      : 'Open this thread in the harness it came from (Enter)'
+    const archive = this.$('#btn-archive')
+    archive.disabled = thread.canArchive === false
+    archive.title = thread.subagent
+      ? 'A worker is retired by the thread that spawned it'
+      : 'Archive — this astronaut walks back to the ship (A)'
   }
 
   /**

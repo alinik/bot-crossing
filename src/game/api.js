@@ -29,7 +29,10 @@ export const saveState = (state) =>
  * thread again, and the browser only ever passes it straight back. Nothing in the UI knows
  * what a Claude Code session id, or a Codex rollout id, actually looks like.
  */
-export const openThread = (thread) => post('/api/open', { harness: thread.harness, ref: thread.ref })
+export const openThread = (thread) =>
+  // A subagent has no session of its own to resume, so opening one opens the thread that
+  // spawned it — which is where its work actually happened.
+  post('/api/open', { harness: thread.harness, ref: thread.parentRef || thread.ref })
 
 export const archiveThread = (thread, archived) =>
   post('/api/archive', { id: thread.id, harness: thread.harness, ref: thread.ref, archived })
