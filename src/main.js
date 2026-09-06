@@ -47,7 +47,7 @@ const engine = new Engine(settings).mount(app)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, ignored: [] }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -197,9 +197,64 @@ const actions = {
     }
   },
 
+  /**
+   * Drop a repo off the map for good — a scratch folder, a bot's own workspace, anything
+   * whose threads are noise rather than work. Archiving each thread would not do: the next
+   * one that repo produces would put the zone straight back.
+   */
+  ignoreProject: () => {
+    const plot = selectedProject ? colony.plots.get(selectedProject) : null
+    const repo = plot?.project
+    if (!repo) return
+    state.ignored = [...new Set([...(state.ignored || []), repo])]
+    queueSave()
+    select(null, {})
+    actions.closeProject()
+    applyThreads(threads)
+    hud.toast(`${repo} is off the map — bring it back under Who shows up`)
+  },
+
+  /**
+   * Un-archive a thread. The one gesture that was missing: archiving wrote to the colony's
+   * list *and* to the harness's own record, and nothing anywhere could undo either — an `A`
+   * pressed by accident took a live thread off the map for good.
+   */
+  restoreThread: async (id) => {
+    const thread = threads.find((t) => t.id === id)
+    state.archived = state.archived.filter((x) => x !== id)
+    const { [id]: _dropped, ...rest } = state.archivedAt || {}
+    state.archivedAt = rest
+    queueSave()
+    // The harness's own flag is best-effort, exactly as it is when archiving: the colony's
+    // list is the authority, and a thread the app has no record for is fine either way.
+    if (thread) {
+      try {
+        await archiveThread(thread, false)
+      } catch {
+        /* the colony has already let it go; the app's flag catches up or does not */
+      }
+    }
+    applyThreads(threads)
+    hud.toast(thread ? `${shortTitle(thread)} is back` : 'Restored')
+    poll()
+  },
+
+  /** Put an ignored repo back. Its zone returns to the ground it was on. */
+  restoreProject: (repo) => {
+    state.ignored = (state.ignored || []).filter((n) => n !== repo)
+    queueSave()
+    applyThreads(threads)
+    hud.toast(`${repo} is back`)
+  },
+
   archiveThread: async () => {
     const thread = threads.find((t) => t.id === selectedId)
     if (!thread) return
+    // Also reachable from the keyboard, so the rule lives here rather than only on the button.
+    if (thread.canArchive === false) {
+      hud.toast(thread.subagent ? 'A worker is retired by its parent, not on its own' : 'Nothing to archive there')
+      return
+    }
     try {
       const res = await archiveThread(thread, true)
       state.archived = [...new Set([...state.archived, thread.id])]
@@ -544,17 +599,54 @@ window.addEventListener('keydown', (e) => {
 
 // ── data ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A thread's title, trimmed to something a one-line row can hold. Skill threads open with the
+ * skill's own preamble, so an untrimmed title is a paragraph.
+ */
+function shortTitle(thread) {
+  const title = (thread.title || 'Untitled thread').replace(/\s+/g, ' ').trim()
+  return title.length > 52 ? `${title.slice(0, 51)}…` : title
+}
+
 function applyThreads(list) {
   threads = list
+
+  /**
+   * Anything worked on since you archived it comes off the list — the scanner spots that and
+   * says so, and the page is the one writer of the file, so the forgetting happens here.
+   */
+  const revived = list.filter((t) => t.unarchivedByActivity && state.archived.includes(t.id))
+  if (revived.length) {
+    const back = new Set(revived.map((t) => t.id))
+    state.archived = state.archived.filter((id) => !back.has(id))
+    state.archivedAt = Object.fromEntries(Object.entries(state.archivedAt || {}).filter(([id]) => !back.has(id)))
+    queueSave()
+    hud.toast(
+      revived.length === 1
+        ? `${shortTitle(revived[0])} is active again — back on the map`
+        : `${revived.length} threads are active again — back on the map`
+    )
+  }
+
   const archivedSet = new Set(state.archived)
-  const stats = colony.setThreads(list, archivedSet)
+  // Ignored repos never reach the colony at all: not a zone, not a count, not a thread in
+  // the sidebar. They are still scanned, so un-ignoring one brings its threads straight back.
+  const ignored = new Set(state.ignored || [])
+  const stats = colony.setThreads(
+    ignored.size ? list.filter((t) => !ignored.has(t.project)) : list,
+    archivedSet
+  )
   hud.setStats(stats)
 
   legendProjects = colony.plotOrder
     .map((plot) => ({
+      id: plot.id,
       name: plot.name,
       accent: plot.accent,
-      count: list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
+      // Counted straight off the zone the colony actually put each thread on: a chip
+      // claiming four when three astronauts stand there reads as a bug, and a split repo
+      // makes that easy to get wrong.
+      count: [...colony.threads.values()].filter((t) => colony.zoneOf?.get(t.id) === plot.id).length,
       urgent: colony.urgentPlots?.has(plot.id) ?? false,
     }))
     .sort((a, b) => b.count - a.count)
@@ -565,6 +657,20 @@ function applyThreads(list) {
     if (still) hud.setSelection(still, list.find((t) => t.id === selectedId) || still.thread)
     else select(null, {})
   }
+  hud.setIgnored(state.ignored || [])
+  // What you archived, newest first — the only route back onto the map.
+  const archivedList = list
+    .filter((t) => archivedSet.has(t.id))
+    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+  hud.setArchived({
+    total: archivedList.length,
+    rows: archivedList.slice(0, 12).map((t) => ({
+      id: t.id,
+      title: shortTitle(t),
+      project: t.project,
+      lastActivityAt: t.lastActivityAt,
+    })),
+  })
   // Which also repaints the legend, so the open zone's chip is lit by the same pass.
   syncProject()
 

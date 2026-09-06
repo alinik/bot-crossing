@@ -398,7 +398,8 @@ export class Hud {
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
     on('#btn-reveal', 'click', () => this.actions.revealProject?.())
     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
-    on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
+    on('#btn-ignore', 'click', () => this.actions.ignoreProject?.())
+    on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.id))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
     on('.help', 'click', (e) => {
       if (e.target === this.$('.help')) this.toggleHelp(false)
@@ -414,6 +415,98 @@ export class Hud {
   syncSettings() {
     for (const c of this.controls) c.sync()
     this.$('.fps').classList.toggle('on', Boolean(this.settings.get('showFps')))
+  }
+
+  /** Which repos are off the map, as chips that put one back when clicked. */
+  setIgnored(names) {
+    const signature = names.join('|')
+    if (this._last.ignored === signature) return
+    this._last.ignored = signature
+    this.ignoredRow.hidden = names.length === 0
+    this.ignoredChips.innerHTML = ''
+    for (const name of names) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'chip'
+      b.textContent = name
+      b.title = `Put ${name} back on the map`
+      b.addEventListener('click', () => this.actions.restoreProject?.(name))
+      this.ignoredChips.appendChild(b)
+    }
+  }
+
+  /**
+   * What you archived, newest first, each row a click away from coming back.
+   *
+   * Capped at what the panel can hold: with a few hundred archived threads a full list is a
+   * scroll nobody reads, and the ones you want back are the ones you just put away.
+   */
+  setArchived({ total = 0, rows = [] } = {}) {
+    const signature = `${total}|${rows.map((r) => r.id).join(',')}`
+    if (this._last.archived === signature) return
+    this._last.archived = signature
+    this.archivedRow.hidden = rows.length === 0
+    this.archivedList.innerHTML = ''
+    for (const row of rows) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'restore-row'
+      b.title = `Bring ${row.title} back onto the map`
+      b.innerHTML =
+        `<span class="t">${escapeHtml(row.title)}</span>` +
+        `<span class="r">${escapeHtml(row.project || '')}</span>` +
+        `<span class="a">${ago(row.lastActivityAt)}</span>`
+      b.addEventListener('click', () => this.actions.restoreThread?.(row.id))
+      this.archivedList.appendChild(b)
+    }
+    if (total > rows.length) {
+      const more = document.createElement('div')
+      more.className = 'restore-more'
+      more.textContent = `${total - rows.length} more archived, oldest first off the list`
+      this.archivedList.appendChild(more)
+    }
+  }
+
+  /**
+   * How much of the account's limits is spent, under the crew counters.
+   *
+   * Spent rather than left, because that is the number every other tool reporting this shows
+   * — a status line saying 92% and a panel saying 8% are the same fact wearing two faces, and
+   * reconciling them in your head every time is a tax on a thing meant to be glanceable.
+   *
+   * Percentages rather than tokens, because a percentage of the window is all any source on
+   * this machine has — and stamped with how old the reading is, since both are caches rather
+   * than live figures.
+   */
+  setUsage(report) {
+    const limits = report?.limits || []
+    const signature =
+      limits.map((l) => `${l.kind}${l.scope}:${l.used}:${l.resetsAt}`).join('|') + `~${report?.fetchedAt || 0}`
+    if (this._last.usage === signature) return
+    this._last.usage = signature
+
+    const el = this.$('.usage')
+    el.hidden = limits.length === 0
+    if (!limits.length) return
+
+    // A three-minute cache is live enough to trust; the CLI's own can be hours old.
+    const stale = report.fetchedAt ? Date.now() - report.fetchedAt > 10 * 60 * 1000 : true
+    el.innerHTML =
+      limits
+        .map((l) => {
+          const name = l.scope ? `${l.label} · ${l.scope}` : l.label
+          const level = l.used >= 90 ? ' low' : l.used >= 75 ? ' warn' : ''
+          return (
+            `<div class="use${level}">` +
+            `<span class="k">${escapeHtml(name)}</span>` +
+            `<span class="bar"><i style="width:${Math.min(100, Math.max(2, l.used))}%"></i></span>` +
+            `<span class="v">${l.used}%</span>` +
+            `<span class="w">${l.resetsAt ? `resets ${until(l.resetsAt)}` : 'window not started'}</span>` +
+            `</div>`
+          )
+        })
+        .join('') +
+      `<div class="use-age${stale ? ' stale' : ''}">${escapeHtml(String(report.source || 'usage'))} · as of ${ago(report.fetchedAt)}</div>`
   }
 
   setStats(stats) {
@@ -922,6 +1015,7 @@ const TEMPLATE = `
           <button class="btn" id="btn-reveal" title="Show this folder in ${FILE_MANAGER}">${ICON.folder} ${FILE_MANAGER}</button>
           <button class="btn" id="btn-copy-path" title="Copy the folder path">${ICON.copy} Copy path</button>
         </div>
+        <button class="btn" id="btn-ignore" title="Take this repo off the map entirely — reversible under Who shows up">${ICON.eyeOff} Ignore this repo</button>
       </div>
       <div class="threads-head"></div>
       <div class="threads"></div>

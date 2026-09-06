@@ -805,7 +805,8 @@ Everything that knows what a *particular* harness's files look like lives in
 `server/harnesses/`. Everything else — the scanner, the API, the whole of `src/` — is written
 against the thread shape and never against a harness.
 
-Colony state lives in `data/colony.json` — where each zone sits and what you archived.
+Colony state lives in `data/colony.json` — where each zone sits, what you archived, and which
+repos you ignored.
 Deleting it only loses the archive list and the map's arrangement; the threads themselves are
 untouched, and the colony lays itself out again from scratch.
 
