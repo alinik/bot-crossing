@@ -705,6 +705,168 @@ async function windowsAppStartedAt() {
   return main && !Number.isNaN(main.when) ? main.when : 0
 }
 
+/** Where the CLI caches what the account has spent of its limits. */
+const CLI_CONFIG = path.join(HOME, '.claude.json')
+
+/**
+ * Where `ccstatusline` caches the same thing.
+ *
+ * It is a status-line widget a lot of people already run, and it asks the API itself — with
+ * the account's own OAuth token, on a three-minute cache. The CLI's copy is refreshed only
+ * when Claude Code happens to talk to the API, which in practice means it can be hours out:
+ * measured side by side, the CLI said 34% of the session was spent while the live answer was
+ * 92%. So if this file is here and fresher, it wins.
+ *
+ * Nothing here fetches anything. Reading a cache another tool on this machine already wrote
+ * is the same bargain as reading the harness's own session files.
+ */
+const CCSTATUSLINE_CACHE = path.join(HOME, '.cache', 'ccstatusline', 'usage.json')
+
+/** Human names for the limit windows the config reports. */
+const LIMIT_LABELS = { session: 'Session', weekly_all: 'Weekly', weekly_scoped: 'Weekly' }
+
+let usageCache = { mtime: 0, value: null }
+let statuslineCache = { mtime: 0, value: null }
+
+/**
+ * How much of the account's limits is left, as Claude Code itself last saw it.
+ *
+ * Claude Code writes what the API told it into `~/.claude.json` under
+ * `cachedUsageUtilization`, and that is the only place this exists locally — the colony has
+ * no account of its own and asks nobody. It is a *cache*: the CLI refreshes it when it talks
+ * to the API, so it can be hours old, which is why `fetchedAt` comes back with it. Anything
+ * showing this has to show its age too, or it is quietly lying.
+ *
+ * Percentages, not tokens: what the API reports is a percentage of the window used, and no
+ * token figure exists anywhere on disk to convert it from.
+ */
+/**
+ * `ccstatusline`'s own cache, if it is on this machine. Its file has no timestamp inside it,
+ * so the mtime is the reading's age — which is exactly what it is, since the tool rewrites the
+ * file each time it refreshes.
+ */
+async function statuslineUsage() {
+  let stat
+  try {
+    stat = await fsp.stat(CCSTATUSLINE_CACHE)
+  } catch {
+    return null
+  }
+  if (statuslineCache.mtime === stat.mtimeMs) return statuslineCache.value
+
+  let raw
+  try {
+    raw = JSON.parse(await fsp.readFile(CCSTATUSLINE_CACHE, 'utf8'))
+  } catch {
+    return null
+  }
+
+  const windows = [
+    { kind: 'session', label: 'Session', used: raw.sessionUsage, resets: raw.sessionResetAt, scope: '' },
+    { kind: 'weekly_all', label: 'Weekly', used: raw.weeklyUsage, resets: raw.weeklyResetAt, scope: '' },
+    { kind: 'weekly_scoped', label: 'Weekly', used: raw.weeklyOpusUsage, resets: raw.weeklyOpusResetAt, scope: 'Opus' },
+    { kind: 'weekly_scoped', label: 'Weekly', used: raw.weeklySonnetUsage, resets: raw.weeklySonnetResetAt, scope: 'Sonnet' },
+  ]
+
+  const limits = windows
+    // A *scoped* window with no reset time is one the account does not have. The session and
+    // weekly windows always exist, and one of them arrives with no reset the moment it rolls
+    // over — a five-hour window has not started again until you next send something — so they
+    // are kept and shown as not started rather than vanishing off the panel.
+    .filter((w) => typeof w.used === 'number' && (w.resets || w.kind !== 'weekly_scoped'))
+    .map((w) => ({
+      kind: w.kind,
+      group: w.kind === 'session' ? 'session' : 'weekly',
+      label: w.label,
+      used: Math.min(100, Math.max(0, Math.round(w.used))),
+      severity: w.used >= 90 ? 'critical' : w.used >= 75 ? 'warning' : 'normal',
+      resetsAt: Date.parse(w.resets) || 0,
+      scope: w.scope,
+    }))
+
+  const value = limits.length ? { fetchedAt: Math.round(stat.mtimeMs), limits, source: 'ccstatusline' } : null
+  statuslineCache = { mtime: stat.mtimeMs, value }
+  return value
+}
+
+async function cliConfigUsage() {
+  let stat
+  try {
+    stat = await fsp.stat(CLI_CONFIG)
+  } catch {
+    return null
+  }
+  if (usageCache.mtime === stat.mtimeMs) return usageCache.value
+
+  let cached
+  try {
+    cached = JSON.parse(await fsp.readFile(CLI_CONFIG, 'utf8')).cachedUsageUtilization
+  } catch {
+    return null
+  }
+  const limits = cached?.utilization?.limits
+  if (!Array.isArray(limits)) return null
+
+  const value = {
+    fetchedAt: num(cached.fetchedAtMs) || 0,
+    source: 'claude-code',
+    limits: limits
+      // Same rule as above: a scoped window needs a reset time to be real; the session and
+      // weekly ones are kept through the moment they roll over.
+      .filter((l) => l && typeof l.percent === 'number' && (l.resets_at || l.kind !== 'weekly_scoped'))
+      .map((l) => ({
+        kind: l.kind || '',
+        group: l.group || '',
+        label: LIMIT_LABELS[l.kind] || l.kind || 'Limit',
+        used: Math.min(100, Math.max(0, Math.round(l.percent))),
+        severity: l.severity || 'normal',
+        resetsAt: Date.parse(l.resets_at) || 0,
+        // `weekly_scoped` is per model — "Weekly · Opus" rather than a second "Weekly".
+        scope: l.scope?.model?.display_name || '',
+      })),
+  }
+  usageCache = { mtime: stat.mtimeMs, value }
+  return value
+}
+
+/**
+ * The freshest reading of the account's limits that exists on this machine.
+ *
+ * Merged *per window* rather than by picking one source outright. Neither cache is
+ * authoritative and neither is complete: right after a five-hour window rolls over,
+ * ccstatusline's file stops mentioning the session at all while the CLI's copy still has it,
+ * and taking the newer file wholesale would drop the row off the panel. So each window comes
+ * from the most recent source that actually reports it, and each carries the age of the
+ * reading it came from.
+ *
+ * Percentages of each window *spent*, not tokens: no token figure exists in either source to
+ * convert from.
+ */
+async function usage() {
+  const sources = (await Promise.all([statuslineUsage(), cliConfigUsage()]))
+    .filter(Boolean)
+    .sort((a, b) => b.fetchedAt - a.fetchedAt)
+  if (!sources.length) return null
+
+  const merged = new Map()
+  for (const source of sources) {
+    for (const limit of source.limits) {
+      const key = `${limit.kind}\u0000${limit.scope}`
+      if (merged.has(key)) continue
+      merged.set(key, { ...limit, source: source.source, fetchedAt: source.fetchedAt })
+    }
+  }
+
+  const limits = [...merged.values()]
+  return {
+    // The panel says how old the reading is, so it has to be the *oldest* contributing one —
+    // the freshest would flatter a row that is actually hours out of date.
+    fetchedAt: Math.min(...limits.map((l) => l.fetchedAt)),
+    source: [...new Set(limits.map((l) => l.source))].join(' + '),
+    limits,
+  }
+}
+
 export default {
   id: 'claude-code',
   name: 'Claude Code',
@@ -715,5 +877,6 @@ export default {
   newSession,
   setArchived,
   appStartedAt,
+  usage,
   paths: { DESKTOP_SESSIONS, CLI_PROJECTS, CLI_LIVE },
 }

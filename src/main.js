@@ -11,6 +11,7 @@ import { crewRig, loadCrew } from './agents/crew.js'
 import { TIMES } from './world/sky.js'
 import {
   fetchThreads,
+  fetchUsage,
   fetchState,
   saveState,
   openThread,
@@ -693,6 +694,14 @@ async function poll() {
     const res = await fetchThreads()
     applyThreads(res.threads || [])
     hud.removeBoot()
+    // Limits ride along with the thread poll: the reading is a cache the harness refreshes on
+    // its own schedule, so asking more often than this would buy nothing.
+    try {
+      const usage = await fetchUsage()
+      hud.setUsage(usage.usage?.[0] || null)
+    } catch {
+      /* the colony does not depend on this; an unreachable endpoint just shows nothing */
+    }
   } catch (err) {
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()

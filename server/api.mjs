@@ -9,6 +9,7 @@ import {
   harnessStatus,
   newSession as harnessNewSession,
   openThread as harnessOpenThread,
+  harnessUsage,
   scanThreads,
   setThreadArchived,
 } from './scan.mjs'
@@ -307,6 +308,10 @@ export async function apiMiddleware(req, res, next) {
     if (url.pathname === '/api/threads' && req.method === 'GET') {
       const threads = await reconcileArchived(await scanThreads())
       return send(res, 200, { threads, scannedAt: Date.now() })
+    }
+
+    if (url.pathname === '/api/usage' && req.method === 'GET') {
+      return send(res, 200, { usage: await harnessUsage() })
     }
 
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {

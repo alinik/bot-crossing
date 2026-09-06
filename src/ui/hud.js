@@ -948,6 +948,23 @@ function shortPath(dir, max = 30) {
   return `…/${out}`
 }
 
+/**
+ * How long until a moment, said the way a countdown wants to be read: `in 47m`, `in 3h 10m`,
+ * `Thu 11:00` once it is far enough away that a duration stops meaning anything.
+ */
+function until(ts) {
+  if (!ts) return 'unknown'
+  const ms = ts - Date.now()
+  if (ms <= 0) return 'now'
+  const mins = Math.round(ms / 60000)
+  if (mins < 60) return `in ${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 12) return `in ${hours}h ${mins % 60}m`
+  const d = new Date(ts)
+  const day = d.toLocaleDateString(undefined, { weekday: 'short' })
+  return `${day} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 function shortModel(model) {
   return String(model).replace(/^claude-/, '').replace(/-\d{8}$/, '')
 }
@@ -1056,6 +1073,7 @@ const TEMPLATE = `
 </div>
 
 <div class="toasts"></div>
+<div class="usage panel" hidden></div>
 <div class="fps panel"></div>
 <div class="hint-pill panel"></div>
 

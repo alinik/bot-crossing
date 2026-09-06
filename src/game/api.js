@@ -13,6 +13,9 @@ const post = (url, payload) =>
   })
 
 export const fetchThreads = () => req('/api/threads')
+
+/** What the harnesses know about the account's own limits. Nothing is fetched remotely. */
+export const fetchUsage = () => req('/api/usage')
 export const fetchState = () => req('/api/state')
 
 export const saveState = (state) =>
