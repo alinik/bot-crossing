@@ -81,6 +81,54 @@ the ship. A CLI-only harness has no such app; omit the method.
 Only `id` is truly required, but the colony gets duller the more you leave out — `project` is
 what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map.
 
+### Return one thread per conversation, not one per record
+
+If a harness writes more than one record for the same conversation — the Claude desktop app
+writes a fresh one every time you resume a thread — merge them before returning. Whatever key
+they share is the thread; a record with no title, no transcript and no live process behind it
+is bookkeeping, not a session, and the adapter drops it.
+
+Two things go wrong if you do not. An archived conversation comes back as a nameless twin,
+because archiving names the ids the *real* record carried and the empty one was never in that
+list. And the colony draws an astronaut with nothing to show for itself, which reads as a bug
+in the world rather than in the scan.
+
+### Optional: `usage()`
+
+A harness that knows what the account has left of its limits can say so. Everything about it
+is optional — a harness without a `usage` shows nothing, rather than the colony inventing a
+number — and nothing may be fetched: answer from whatever your own tooling has already cached
+on this machine.
+
+```js
+async function usage() {
+  return {
+    fetchedAt: 1788691865947,   // epoch ms — when the reading was taken, not when it was read
+    source: 'ccstatusline',     // shown on the panel, so two sources can be told apart
+    limits: [
+      { kind: 'session', group: 'session', label: 'Session', used: 92,
+        severity: 'critical', resetsAt: 1788706800086, scope: '' },
+      { kind: 'weekly_all', group: 'weekly', label: 'Weekly', used: 45,
+        severity: 'normal', resetsAt: 1789038000086, scope: '' },
+    ],
+  }
+}
+```
+
+`used` is a **percentage of the window spent**, not tokens: that is what these APIs report and
+there is no token figure on disk to convert it from. `fetchedAt` is mandatory in spirit — the
+panel stamps the reading with its age and marks it stale past ten minutes, because a cache
+presented as live is a lie with a number on it. `scope` names a model when the limit is
+per-model, so it can be shown as "Weekly · Opus".
+
+Return a window that has just rolled over — a percentage with no reset time — rather than
+dropping it: the panel shows that as `window not started`, and a row that vanishes at the moment
+it resets reads as a bug. Drop only *scoped* windows with no reset time; those are limits the
+account does not have.
+
+An adapter may read more than one source. Merge them **per window**, taking each from the most
+recent source that reports it, and report the age of the oldest reading you used.
+
 | Field | Type | What it means |
 | --- | --- | --- |
 | `id` | string | **Unique across every harness.** A UUID is fine; otherwise prefix it, e.g. `my-harness:1234` |
@@ -93,16 +141,19 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
 | `gitBranch` | string | Branch name, or `''` |
 | `model` / `effort` | string | Shown on the thread card |
 | `createdAt` | number | Epoch ms |
-| `lastActivityAt` | number | Epoch ms. Sorts the colony and drives the "asleep for 3 days" behaviour |
+| `lastActivityAt` | number | Epoch ms. Sorts the colony and decides dormancy — see the idle window under **Who shows up** |
 | `lastFocusedAt` | number | Epoch ms, `0` if unknowable |
-| `running` | boolean | Working **right now** — the astronaut hammers away |
-| `unread` | boolean | Moved on since you last looked — the astronaut stops and holds a `?` |
+| `running` | boolean | Working **right now** — the astronaut hammers away. A live process is not enough: a session sitting at its prompt is not running, so check that the thread is mid-turn |
+| `unread` | boolean | Wants you — moved on since you last looked, or handed the turn back and is waiting on a reply. The astronaut stops and holds a `?` |
 | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
+| `subagent` | boolean | This thread is a worker its parent spawned. Drawn in a yellow suit, on the parent's zone, and never openable or archivable |
+| `parentId` | string | The thread that spawned it, when `subagent` is set. Give a subagent its **parent's** `project`/`projectPath`, not its own working directory's — a worker usually runs in a worktree or a scratch folder |
+| `parentRef` | object | Opaque ref for the *parent*, when `subagent` is set: opening a worker opens the thread that spawned it. Keep it apart from `ref`, and leave a worker's own `ref` empty — a worker is never archivable, and pointing `ref` at the parent would archive a live thread from a click on one of its workers |
 | `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
 | `archived` | boolean | Archived in the harness's own records |
 | `sizeBytes` | number | Transcript size. **This is how finished a building looks**, on a log scale |
 | `source` | string | Free-form, for your own bookkeeping (the Claude adapter uses `desktop` / `cli`) |
-| `canOpen` / `canArchive` | boolean | Whether this thread supports those actions. The UI greys the buttons out |
+| `canOpen` / `canArchive` | boolean | Whether this thread supports those actions. The UI greys the buttons out. Set `canArchive` for any real thread, including one your harness keeps no record of — archiving is recorded in the colony's own list, and the record write is best-effort on top of that |
 | `ref` | object | **Opaque.** Whatever *you* need to find this thread again |
 
 ### About `ref`

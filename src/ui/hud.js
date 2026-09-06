@@ -3,6 +3,7 @@ import { PLANETS } from '../world/planet.js'
 import { TIMES } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
+import { MODEL_COLOURS, helmetFor } from '../agents/astronauts.js'
 
 /**
  * The whole HUD, in plain DOM.
@@ -168,7 +169,15 @@ export class Hud {
       ),
       this._toggle('Adaptive quality', 'autoQuality', 'Quietly drops render scale if frames get expensive.'),
       this._slider('Scatter', 'scatterDensity', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
-      this._slider('Max crew', 'maxAgents', 10, 200, 10, (v) => String(v)),
+      this._slider(
+        'Crew capacity',
+        'maxAgents',
+        10,
+        200,
+        10,
+        (v) => String(v),
+        'How many astronauts the renderer has room for. Who is out at all is “Who shows up”, below.'
+      ),
       this._toggle('Stars', 'stars')
     )
     body.appendChild(perf)
@@ -229,6 +238,55 @@ export class Hud {
       this._toggle('Show FPS', 'showFps')
     )
     body.appendChild(view)
+
+    // Who shows up. Not a quality setting — it decides what the colony is *about* — so it
+    // sits on its own rather than under a preset that would overwrite it.
+    const crowd = group('Who shows up')
+    crowd.append(
+      chips(
+        [
+          { id: 'active', label: 'Active', title: 'Running, asking for you, or touched inside the idle window' },
+          { id: 'all', label: 'All', title: 'Every thread you have not archived, dormant ones included' },
+        ],
+        () => this.settings.get('crewFilter'),
+        (id) => this.settings.set('crewFilter', id),
+        this.controls
+      ),
+      this._slider(
+        'Idle window',
+        'idleWindow',
+        5,
+        720,
+        5,
+        (v) => (v >= 60 ? `${(v / 60).toFixed(v % 60 ? 1 : 0)}h` : `${v}m`),
+        'How long a quiet thread still counts as active. Ignored while All is on.'
+      ),
+      this._slider(
+        'Split a repo at',
+        'splitAt',
+        0,
+        60,
+        1,
+        (v) => (v > 0 ? `${v} threads` : 'Never'),
+        'Past this many threads a repo becomes one zone per kind of work — reviews, tickets, incidents.'
+      )
+    )
+    // Filled by `setIgnored`, and empty — so invisible — until something is actually ignored.
+    this.ignoredRow = this._row('Ignored repos', 'Click one to put it back on the map.')
+    this.ignoredChips = document.createElement('div')
+    this.ignoredChips.className = 'chips'
+    this.ignoredRow.appendChild(this.ignoredChips)
+    this.ignoredRow.hidden = true
+    crowd.appendChild(this.ignoredRow)
+
+    // The way back from an archive. Same shape: hidden until there is something in it.
+    this.archivedRow = this._row('Archived threads', 'Click one to bring its astronaut back.')
+    this.archivedList = document.createElement('div')
+    this.archivedList.className = 'restore'
+    this.archivedRow.appendChild(this.archivedList)
+    this.archivedRow.hidden = true
+    crowd.appendChild(this.archivedRow)
+    body.appendChild(crowd)
   }
 
   _row(label, hint) {
@@ -341,7 +399,8 @@ export class Hud {
     on('#btn-new-session', 'click', () => this.actions.newConversation?.())
     on('#btn-reveal', 'click', () => this.actions.revealProject?.())
     on('#btn-copy-path', 'click', () => this.actions.copyProjectPath?.())
-    on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.name))
+    on('#btn-ignore', 'click', () => this.actions.ignoreProject?.())
+    on('#btn-locate', 'click', () => this.actions.focusProject?.(this.project?.id))
     on('#btn-close-project', 'click', () => this.actions.closeProject?.())
     on('.help', 'click', (e) => {
       if (e.target === this.$('.help')) this.toggleHelp(false)
@@ -357,6 +416,98 @@ export class Hud {
   syncSettings() {
     for (const c of this.controls) c.sync()
     this.$('.fps').classList.toggle('on', Boolean(this.settings.get('showFps')))
+  }
+
+  /** Which repos are off the map, as chips that put one back when clicked. */
+  setIgnored(names) {
+    const signature = names.join('|')
+    if (this._last.ignored === signature) return
+    this._last.ignored = signature
+    this.ignoredRow.hidden = names.length === 0
+    this.ignoredChips.innerHTML = ''
+    for (const name of names) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'chip'
+      b.textContent = name
+      b.title = `Put ${name} back on the map`
+      b.addEventListener('click', () => this.actions.restoreProject?.(name))
+      this.ignoredChips.appendChild(b)
+    }
+  }
+
+  /**
+   * What you archived, newest first, each row a click away from coming back.
+   *
+   * Capped at what the panel can hold: with a few hundred archived threads a full list is a
+   * scroll nobody reads, and the ones you want back are the ones you just put away.
+   */
+  setArchived({ total = 0, rows = [] } = {}) {
+    const signature = `${total}|${rows.map((r) => r.id).join(',')}`
+    if (this._last.archived === signature) return
+    this._last.archived = signature
+    this.archivedRow.hidden = rows.length === 0
+    this.archivedList.innerHTML = ''
+    for (const row of rows) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = 'restore-row'
+      b.title = `Bring ${row.title} back onto the map`
+      b.innerHTML =
+        `<span class="t">${escapeHtml(row.title)}</span>` +
+        `<span class="r">${escapeHtml(row.project || '')}</span>` +
+        `<span class="a">${ago(row.lastActivityAt)}</span>`
+      b.addEventListener('click', () => this.actions.restoreThread?.(row.id))
+      this.archivedList.appendChild(b)
+    }
+    if (total > rows.length) {
+      const more = document.createElement('div')
+      more.className = 'restore-more'
+      more.textContent = `${total - rows.length} more archived, oldest first off the list`
+      this.archivedList.appendChild(more)
+    }
+  }
+
+  /**
+   * How much of the account's limits is spent, under the crew counters.
+   *
+   * Spent rather than left, because that is the number every other tool reporting this shows
+   * — a status line saying 92% and a panel saying 8% are the same fact wearing two faces, and
+   * reconciling them in your head every time is a tax on a thing meant to be glanceable.
+   *
+   * Percentages rather than tokens, because a percentage of the window is all any source on
+   * this machine has — and stamped with how old the reading is, since both are caches rather
+   * than live figures.
+   */
+  setUsage(report) {
+    const limits = report?.limits || []
+    const signature =
+      limits.map((l) => `${l.kind}${l.scope}:${l.used}:${l.resetsAt}`).join('|') + `~${report?.fetchedAt || 0}`
+    if (this._last.usage === signature) return
+    this._last.usage = signature
+
+    const el = this.$('.usage')
+    el.hidden = limits.length === 0
+    if (!limits.length) return
+
+    // A three-minute cache is live enough to trust; the CLI's own can be hours old.
+    const stale = report.fetchedAt ? Date.now() - report.fetchedAt > 10 * 60 * 1000 : true
+    el.innerHTML =
+      limits
+        .map((l) => {
+          const name = l.scope ? `${l.label} · ${l.scope}` : l.label
+          const level = l.used >= 90 ? ' low' : l.used >= 75 ? ' warn' : ''
+          return (
+            `<div class="use${level}">` +
+            `<span class="k">${escapeHtml(name)}</span>` +
+            `<span class="bar"><i style="width:${Math.min(100, Math.max(2, l.used))}%"></i></span>` +
+            `<span class="v">${l.used}%</span>` +
+            `<span class="w">${l.resetsAt ? `resets ${until(l.resetsAt)}` : 'window not started'}</span>` +
+            `</div>`
+          )
+        })
+        .join('') +
+      `<div class="use-age${stale ? ' stale' : ''}">${escapeHtml(String(report.source || 'usage'))} · as of ${ago(report.fetchedAt)}</div>`
   }
 
   setStats(stats) {
@@ -375,8 +526,9 @@ export class Hud {
    * it is a list now because the sidebar is where all the chrome lives, and because a list
    * can carry a count and an alarm without running out of room at eleven repos.
    */
-  setLegend(projects, activeName = null) {
-    const signature = projects.map((p) => `${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') + `~${activeName}`
+  setLegend(projects, activeId = null) {
+    const signature =
+      projects.map((p) => `${p.id}:${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') + `~${activeId}`
     if (this._last.legend === signature) return
     this._last.legend = signature
 
@@ -387,16 +539,16 @@ export class Hud {
       b.type = 'button'
       b.className = 'repo'
       b.title = `${p.count} thread${p.count === 1 ? '' : 's'} in ${p.name}`
-      b.setAttribute('aria-pressed', String(p.name === activeName))
+      b.setAttribute('aria-pressed', String(p.id === activeId))
       b.innerHTML =
         `<i class="swatch" style="background:${hex(p.accent)};color:${hex(p.accent)}"></i>` +
         `<span class="n">${escapeHtml(p.name)}</span>` +
         (p.urgent ? '<i class="alarm"></i>' : '') +
         `<span class="count">${p.count}</span>`
-      b.addEventListener('click', () => this.actions.pickProject?.(p.name))
+      b.addEventListener('click', () => this.actions.pickProject?.(p.id))
       wrap.appendChild(b)
     }
-    this.$('.sec-head span').textContent = `${projects.length} repo${projects.length === 1 ? '' : 's'}`
+    this.$('.sec-head span').textContent = `${projects.length} zone${projects.length === 1 ? '' : 's'}`
   }
 
   /**
@@ -419,7 +571,7 @@ export class Hud {
     // nothing is happening keeps whatever "4m ago" it was first drawn with, for as long as
     // you leave the panel open.
     const signature =
-      `${project.name}~${project.path}~${project.accent}~${project.selectedId}~${Math.floor(Date.now() / 60000)}~` +
+      `${project.id}~${project.name}~${project.path}~${project.accent}~${project.selectedId}~${Math.floor(Date.now() / 60000)}~` +
       project.threads.map((t) => `${t.id}:${t.status}:${t.title}:${t.lastActivityAt}`).join('|')
     panel.classList.add('drilled')
     if (this._last.project === signature) return
@@ -503,9 +655,18 @@ export class Hud {
       `<span class="tag"><i class="swatch" style="background:${hex(agent.trim.getHex())}"></i>${escapeHtml(status)}</span>`,
     ]
     // The repo is the panel's own heading now, so the card says what the *thread* is.
+    // A yellow astronaut is somebody else's worker: say so, since there is nothing to open.
+    if (thread.subagent) bits.push('<span class="tag">↳ subagent</span>')
     if (thread.worktree) bits.push(`<span class="tag">⑂ ${escapeHtml(thread.worktree)}</span>`)
     if (thread.gitBranch) bits.push(`<span class="tag">${escapeHtml(thread.gitBranch)}</span>`)
-    if (thread.model) bits.push(`<span class="tag">${escapeHtml(shortModel(thread.model))}</span>`)
+    // The swatch is the helmet the astronaut is actually wearing, so the card explains the
+    // colour rather than repeating the name in a second place.
+    if (thread.model) {
+      const tint = hex(helmetFor(thread.model, 0x8b8b85))
+      bits.push(
+        `<span class="tag"><i class="swatch" style="background:${tint}"></i>${escapeHtml(shortModel(thread.model))}</span>`
+      )
+    }
     bits.push(`<span>${ago(thread.lastActivityAt)}</span>`)
     meta.innerHTML = bits.join('')
 
@@ -516,7 +677,18 @@ export class Hud {
     // astronaut needs its size sixty times a second, and asking the layout for it that
     // often is how a HUD starts costing frames.
     this._cardSize = { w: card.offsetWidth, h: card.offsetHeight }
-    this.$('#btn-open').disabled = thread.canOpen === false
+    const open = this.$('#btn-open')
+    open.disabled = thread.canOpen === false
+    // A worker has no session of its own, so say where the button actually goes.
+    open.innerHTML = `${ICON.open} ${thread.subagent ? 'Open parent' : 'Open'}`
+    open.title = thread.subagent
+      ? 'Open the thread that spawned this worker (Enter)'
+      : 'Open this thread in the harness it came from (Enter)'
+    const archive = this.$('#btn-archive')
+    archive.disabled = thread.canArchive === false
+    archive.title = thread.subagent
+      ? 'A worker is retired by the thread that spawned it'
+      : 'Archive — this astronaut walks back to the ship (A)'
   }
 
   /**
@@ -776,6 +948,23 @@ function shortPath(dir, max = 30) {
   return `…/${out}`
 }
 
+/**
+ * How long until a moment, said the way a countdown wants to be read: `in 47m`, `in 3h 10m`,
+ * `Thu 11:00` once it is far enough away that a duration stops meaning anything.
+ */
+function until(ts) {
+  if (!ts) return 'unknown'
+  const ms = ts - Date.now()
+  if (ms <= 0) return 'now'
+  const mins = Math.round(ms / 60000)
+  if (mins < 60) return `in ${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 12) return `in ${hours}h ${mins % 60}m`
+  const d = new Date(ts)
+  const day = d.toLocaleDateString(undefined, { weekday: 'short' })
+  return `${day} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 function shortModel(model) {
   return String(model).replace(/^claude-/, '').replace(/-\d{8}$/, '')
 }
@@ -844,6 +1033,7 @@ const TEMPLATE = `
           <button class="btn" id="btn-reveal" title="Show this folder in ${FILE_MANAGER}">${ICON.folder} ${FILE_MANAGER}</button>
           <button class="btn" id="btn-copy-path" title="Copy the folder path">${ICON.copy} Copy path</button>
         </div>
+        <button class="btn" id="btn-ignore" title="Take this repo off the map entirely — reversible under Who shows up">${ICON.eyeOff} Ignore this repo</button>
       </div>
       <div class="threads-head"></div>
       <div class="threads"></div>
@@ -883,6 +1073,7 @@ const TEMPLATE = `
 </div>
 
 <div class="toasts"></div>
+<div class="usage panel" hidden></div>
 <div class="fps panel"></div>
 <div class="hint-pill panel"></div>
 
@@ -919,7 +1110,12 @@ const TEMPLATE = `
       <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session hit an error</div>
       <div class="legend-row"><i class="badge" style="background:#16301f;color:#7fd39a">⚒</i> running right now, building</div>
       <div class="legend-row"><i class="badge" style="background:#332b12;color:#e6c67f">✓</i> its pull request landed</div>
-      <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> nothing for three days</div>
+      <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> quiet past the idle window — left off the surface, see Who shows up</div>
+      <div class="legend-row" style="margin-top:10px">
+        <span style="opacity:.7">helmet colour is the model:</span>
+        ${MODEL_COLOURS.map(([name, tint]) => `<i class="swatch" style="background:${hex(tint)}"></i>${name}`).join('&nbsp; ')}
+      </div>
+      <div class="legend-row"><span style="opacity:.7">a yellow suit is a subagent — it works on its parent's zone</span></div>
     </div>
     <div style="margin-top:18px;display:flex;justify-content:flex-end">
       <button class="btn primary" id="btn-help-close">Got it</button>

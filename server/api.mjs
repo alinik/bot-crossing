@@ -9,6 +9,7 @@ import {
   harnessStatus,
   newSession as harnessNewSession,
   openThread as harnessOpenThread,
+  harnessUsage,
   scanThreads,
   setThreadArchived,
 } from './scan.mjs'
@@ -29,6 +30,7 @@ const emptyState = () => ({
   archived: [],
   archivedAt: {},
   opened: [],
+  ignored: [],
   plots: {},
   seen: {},
   settings: null,
@@ -46,6 +48,9 @@ async function readState() {
       archived: asArray(raw.archived),
       archivedAt: asObject(raw.archivedAt),
       opened: asArray(raw.opened),
+      // Repos taken off the map on purpose. Kept here rather than in the browser's own
+      // settings so the choice survives a different browser, like the layout does.
+      ignored: asArray(raw.ignored),
       plots: asObject(raw.plots),
       seen: asObject(raw.seen),
       settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
@@ -67,6 +72,7 @@ async function writeState(next) {
     archived: asArray(next.archived),
     archivedAt: asObject(next.archivedAt),
     opened: asArray(next.opened),
+    ignored: asArray(next.ignored),
     plots: asObject(next.plots),
     seen: asObject(next.seen),
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
@@ -132,6 +138,13 @@ async function resolveFolder(folder) {
  * poll. `archivePending` is true while the flag is on disk but the running app has not read
  * it yet — that astronaut is walking to the ship but has not boarded.
  */
+/**
+ * How much later than the archive itself a write has to be before it counts as the thread
+ * coming back. Archiving a live thread makes the harness touch its own records, so a couple
+ * of seconds of slack keeps that from reading as activity and undoing the archive instantly.
+ */
+const REVIVE_GRACE_MS = 5000
+
 async function reconcileArchived(threads) {
   const state = await readState()
   if (!state.archived.length) return threads
@@ -143,17 +156,61 @@ async function reconcileArchived(threads) {
     startedAt.set(id, await harnessAppStartedAt(id))
   }
 
-  return Promise.all(
+  /**
+   * An archive is remembered by the thread id the page saw, but that id is only the
+   * *canonical* one: a thread keyed by a desktop record today can be keyed by its
+   * transcript tomorrow, once the CLI writes one. Matching on the ids inside `ref` as well
+   * means an archive survives that hand-over instead of the thread quietly reappearing
+   * under its new name.
+   */
+  const isArchived = (thread) => {
+    // A worker's `ref` is empty by design, so there is nothing to re-assert on disk for it.
+    if (thread.subagent) return wanted.has(thread.id)
+    if (wanted.has(thread.id)) return true
+    const ref = thread.ref || {}
+    if (ref.cliSessionId && wanted.has(ref.cliSessionId)) return true
+    return (ref.desktopSessionIds || []).some((id) => wanted.has(id))
+  }
+
+  const reconciled = await Promise.all(
     threads.map(async (thread) => {
-      if (!wanted.has(thread.id)) return thread
+      if (!isArchived(thread)) return thread
       if (!thread.archived && thread.canArchive) {
         await setThreadArchived(thread.harness, thread.ref, true).catch(() => {})
       }
-      const at = state.archivedAt[thread.id] ?? 0
+      const ids = [thread.id, thread.ref?.cliSessionId, ...(thread.ref?.desktopSessionIds || [])]
+      const at = Math.max(0, ...ids.map((id) => (id && state.archivedAt[id]) || 0))
+
+      /**
+       * A thread that has been worked on since you archived it is not archived any more.
+       *
+       * Archiving says "I am done with this". Going back to the session says the opposite,
+       * and it is the more recent of the two — so the flag comes off rather than the colony
+       * arguing with the harness about a thread you are visibly using. The page owns the
+       * list, so it is told through `unarchivedByActivity` rather than written to here.
+       */
+      if (at && thread.lastActivityAt > at + REVIVE_GRACE_MS) {
+        if (thread.archived && thread.canArchive) {
+          await setThreadArchived(thread.harness, thread.ref, false).catch(() => {})
+        }
+        return { ...thread, archived: false, unarchivedByActivity: true }
+      }
+
       const appStart = startedAt.get(thread.harness) || 0
       return { ...thread, archived: true, archivePending: !(appStart && appStart > at) }
     })
   )
+
+  /**
+   * A worker goes with the thread that spawned it.
+   *
+   * Its own archive flag can never be set — there is no record to write and no button to
+   * press — so without this an archived thread leaves its workers behind: a zone holding
+   * nothing but orphans, none of which can be retired or lead anywhere. Archiving the parent
+   * is the one gesture that retires them, which is exactly what it should mean.
+   */
+  const gone = new Set(reconciled.filter((t) => t.archived).map((t) => t.id))
+  return reconciled.map((t) => (t.subagent && !t.archived && gone.has(t.parentId) ? { ...t, archived: true } : t))
 }
 
 function send(res, status, body) {
@@ -253,6 +310,10 @@ export async function apiMiddleware(req, res, next) {
       return send(res, 200, { threads, scannedAt: Date.now() })
     }
 
+    if (url.pathname === '/api/usage' && req.method === 'GET') {
+      return send(res, 200, { usage: await harnessUsage() })
+    }
+
     if (url.pathname === '/api/harnesses' && req.method === 'GET') {
       return send(res, 200, { harnesses: await harnessStatus() })
     }
@@ -290,8 +351,11 @@ export async function apiMiddleware(req, res, next) {
       const { id, harness, ref, archived } = await readJsonBody(req)
       if (!id) return send(res, 400, { ok: false, error: 'Missing thread id' })
 
-      // Only the harness's own records are touched here — the page records the intent.
-      if (!ref || !harness) {
+      // Only the harness's own records are touched here — the page records the intent. A
+      // thread the harness has no record for is archived in the colony alone, which is a
+      // success rather than a failure: the astronaut goes home either way.
+      const records = ref?.desktopSessionIds?.length || 0
+      if (!ref || !harness || !records) {
         return send(res, 200, {
           ok: true,
           archived: Boolean(archived),

@@ -80,6 +80,28 @@ export async function scanThreads() {
 }
 
 /** What the HUD shows in the harness list: who is installed, and what they can do. */
+/**
+ * What every detected harness reports about the account's own limits.
+ *
+ * Optional on purpose: a harness that knows nothing about limits has no `usage`, and the
+ * colony then shows nothing rather than inventing a number. Nothing is fetched — an adapter
+ * answers from whatever its own tooling has already cached on this machine.
+ */
+export async function harnessUsage() {
+  const harnesses = await detectedHarnesses()
+  const out = []
+  for (const h of harnesses) {
+    if (typeof h.usage !== 'function') continue
+    try {
+      const value = await h.usage()
+      if (value?.limits?.length) out.push({ harness: h.id, harnessName: h.name, ...value })
+    } catch (err) {
+      console.warn(`bot-crossing: harness "${h.id}" could not report usage —`, err?.message || err)
+    }
+  }
+  return out
+}
+
 export async function harnessStatus() {
   const detected = new Set((await detectedHarnesses()).map((h) => h.id))
   return HARNESSES.map((h) => ({ id: h.id, name: h.name, detected: detected.has(h.id) }))

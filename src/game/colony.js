@@ -18,6 +18,7 @@ import { Astronauts } from '../agents/astronauts.js'
 import { Indicators, BADGE } from '../agents/indicators.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
+import { zonesFor } from './task-types.js'
 
 /**
  * The colony: everything that turns a list of agent threads into a place.
@@ -38,7 +39,12 @@ import { Navigation } from '../agents/navigation.js'
  * you have running.
  */
 
-const STALE_MS = 3 * 24 * 60 * 60 * 1000
+/**
+ * How long a thread can sit untouched before it counts as dormant, when nothing says
+ * otherwise. The colony reads this off the `idleWindow` setting instead — half an hour by
+ * default, which is about how long a session you have walked away from stays worth a tile.
+ */
+const STALE_MS = 30 * 60 * 1000
 /** How wide an astronaut is, for the purpose of not fitting through gaps it should not. */
 const AGENT_RADIUS = 0.26
 /** Progress a live thread adds per second, so a working site visibly grows while you watch. */
@@ -60,13 +66,73 @@ export const STATUS_LABEL = {
 }
 
 /** Thread → behaviour. First match wins, exactly like the board's auto-sort. */
-export function statusFor(thread, now = Date.now()) {
+export function statusFor(thread, now = Date.now(), staleMs = STALE_MS) {
+  // A subagent has a much shorter vocabulary: it is working or it is not. Only a thread you
+  // are actually in can ask you a question, and a `?` over a worker sends you somewhere there
+  // is nothing to answer — so the states that want your attention are not available to it,
+  // whatever a harness adapter says. Enforced here rather than only in the adapter, because
+  // this is the one function the world and the sidebar both read.
+  if (thread.subagent) {
+    if (thread.running) return 'working'
+    return now - thread.lastActivityAt > staleMs ? 'sleeping' : 'idle'
+  }
   if (thread.hasError) return 'blocked'
   if (thread.running) return 'working'
   if (thread.prState === 'MERGED') return 'celebrating'
   if (thread.unread) return 'waiting'
-  if (now - thread.lastActivityAt > STALE_MS) return 'sleeping'
+  if (now - thread.lastActivityAt > staleMs) return 'sleeping'
   return 'idle'
+}
+
+/**
+ * Who survives when the crowd has to be cut, best first. Not `STATUS_ORDER`: that ranks by
+ * how loudly a thread is asking for you, which is right for a *list*, but a running thread
+ * is the one thing the window is open to watch — losing it to older unread ones is the one
+ * outcome a cut must never produce.
+ */
+const CUT_ORDER = ['working', 'blocked', 'waiting', 'celebrating', 'idle', 'sleeping']
+
+/**
+ * Who earns a place on the surface, and in what order.
+ *
+ * The colony is not a thread list. A session nobody has touched in half an hour is over, and
+ * drawing it spends a building, a body and a slice of the map on something with nothing to
+ * say — with a few hundred of them the handful that are live are impossible to pick out. So
+ * **active** is the default: a thread is out if it is running, if it is asking for you (a
+ * reply wanted, or stuck on an error), or if anything touched it inside the idle window.
+ * Everything else is dormant and stays off the surface.
+ *
+ * Subagents are stricter: they are out only while actually running, since a finished one
+ * has nothing to say and cannot be opened.
+ *
+ * **all** is the other setting, and means exactly what it says: every thread that is not
+ * archived, dormant and finished subagents included. Useful for seeing the whole shape of what you have; not
+ * something to leave on, because it is the pile the filter exists to thin.
+ *
+ * Nothing is deleted either way. A thread left off is still scanned, and walks back down the
+ * ramp the moment it earns a place again.
+ */
+export function selectVisible(threads, { now = Date.now(), windowMs = STALE_MS, showAll = false } = {}) {
+  const kept = []
+  for (const thread of threads) {
+    const status = statusFor(thread, now, windowMs)
+    // Dormant means quiet past the window *and* asking for nothing — `statusFor` has already
+    // ruled out running, merged and unread by the time it says so.
+    if (!showAll && status === 'sleeping') continue
+    // A subagent is only ever interesting while it is running. It cannot want a reply and
+    // has nothing to open, so a finished one is a body standing on its parent's site saying
+    // nothing — and a thread that fanned out ten times leaves ten of them. They go the
+    // moment the work does, rather than lingering out the idle window like a real thread.
+    if (!showAll && thread.subagent && status !== 'working') continue
+    kept.push({ thread, status })
+  }
+  // Ranked even when nothing is being cut: the renderer's own crew capacity is a cut of last
+  // resort, and it takes the roster in the order it is given.
+  kept.sort((a, b) => {
+    const rank = CUT_ORDER.indexOf(a.status) - CUT_ORDER.indexOf(b.status)
+    return rank || (b.thread.lastActivityAt ?? 0) - (a.thread.lastActivityAt ?? 0)
+  })
+  return kept.map((entry) => entry.thread)
 }
 
 /**
@@ -120,6 +186,8 @@ export class Colony {
 
     this.plots = new Map()
     this.plotOrder = []
+    /** Thread id → the zone it stands on. A repo, or a slice of a repo split by task type. */
+    this.zoneOf = new Map()
     /**
      * Where every zone sits, kept across polls *and* across the departures of the threads
      * that made it: a repo whose last session you archive comes back to the same ground
@@ -155,6 +223,8 @@ export class Colony {
     this._dustTint = new THREE.Color(this.planet.ground.high)
     this._c = new THREE.Color()
     this.stats = { agents: 0, projects: 0, working: 0, waiting: 0, blocked: 0, done: 0 }
+    /** The idle window in force, in ms. Set from settings on every scan. */
+    this.staleMs = Math.max(1, settings.get('idleWindow')) * 60 * 1000
 
     this._buildTerrain()
   }
@@ -259,25 +329,36 @@ export class Colony {
    */
   setThreads(threads, archivedIds = new Set()) {
     const now = Date.now()
-    const live = threads.filter((t) => !t.archived && !archivedIds.has(t.id))
+    // Who is on the surface at all — see `selectVisible`. Both knobs are settings rather than
+    // constants because how much of your own thread list you want standing in front of you is
+    // a taste, not a fact.
+    this.staleMs = Math.max(1, this.settings.get('idleWindow')) * 60 * 1000
+    const ranked = selectVisible(
+      threads.filter((t) => !t.archived && !archivedIds.has(t.id)),
+      { now, windowMs: this.staleMs, showAll: this.settings.get('crewFilter') === 'all' }
+    )
+    // The renderer's crew capacity is the last cut, and it has to be taken *here* rather than
+    // left to `setRoster`: past it there is no astronaut, so a building, a zone and a line in
+    // the counts would all be claiming somebody who is not on the surface. `selectVisible`
+    // has already ranked the list, so what survives is the busiest end of it.
+    const live = ranked.slice(0, Math.max(1, this.settings.get('maxAgents')))
 
-    // Group by repo, biggest project first so the busiest work lands nearest the middle.
-    const byProject = new Map()
-    for (const thread of live) {
-      const key = thread.project || 'unknown'
-      if (!byProject.has(key)) byProject.set(key, [])
-      byProject.get(key).push(thread)
+    // One zone per repo, biggest first so the busiest work lands nearest the middle —
+    // except that a repo crowded enough to be unreadable splits into a zone per kind of
+    // work, which is what keeps a workspace folder from becoming one giant pile.
+    const zones = zonesFor(live, this.settings.get('splitAt'))
+    // Which zone every thread belongs to, so the sidebar and the legend group threads the
+    // same way the ground does rather than each deciding for themselves.
+    this.zoneOf = new Map()
+    for (const zone of zones.values()) {
+      for (const thread of zone.threads) this.zoneOf.set(thread.id, zone.key)
     }
-    const projects = [...byProject.entries()].sort((a, b) => {
-      if (b[1].length !== a[1].length) return b[1].length - a[1].length
-      return a[0].localeCompare(b[0])
-    })
 
-    this._syncPlots(projects)
+    this._syncPlots(zones)
 
     const roster = []
     const seenBuildings = new Set()
-    const stats = { agents: 0, projects: projects.length }
+    const stats = { agents: 0, projects: zones.size }
     for (const key of STATUS_ORDER) stats[key] = 0
     // Plots holding anything that wants your attention get a pulsing rim, so you can spot
     // the repo that needs you from right across the colony without reading a single label.
@@ -286,14 +367,14 @@ export class Colony {
     // only show it on hover.
     const active = new Set()
 
-    for (const [name, list] of projects) {
-      const plot = this.plots.get(name)
+    for (const zone of zones.values()) {
+      const plot = this.plots.get(zone.key)
       if (!plot) continue
       // Oldest thread first, so a given session keeps its slot as siblings come and go.
-      list.sort((a, b) => a.createdAt - b.createdAt)
+      const list = [...zone.threads].sort((a, b) => a.createdAt - b.createdAt)
 
       list.forEach((thread, i) => {
-        const status = statusFor(thread, now)
+        const status = statusFor(thread, now, this.staleMs)
         if (stats[status] !== undefined) stats[status]++
         if (status === 'waiting' || status === 'blocked') urgent.add(plot.id)
         if (status === 'waiting' || status === 'blocked' || status === 'working') active.add(plot.id)
@@ -306,6 +387,10 @@ export class Colony {
           id: thread.id,
           thread,
           status,
+          // Drawn in a different suit — see `SUBAGENT_SUIT`. A fan-out is a crowd of them
+          // around one building, and that only reads if they are told apart from the thread
+          // that spawned them.
+          subagent: Boolean(thread.subagent),
           site: this._workSite(plot, building, i),
           // Where the work actually is. A working astronaut circles it rather than standing
           // at one spot, so it needs the building, not just a place to stand near it.
@@ -329,12 +414,12 @@ export class Colony {
     return this.stats
   }
 
-  _syncPlots(projects) {
+  _syncPlots(zones) {
     // The previous layout is an input, so a zone only moves when its own footprint changes
     // — never because a different repo gained or lost a thread. `plotCells` carries it
     // between polls, and the colony file carries it between sessions.
     const layout = allocateCells(
-      projects.map(([name, list]) => ({ id: name, size: list.length })),
+      [...zones.values()].map((zone) => ({ id: zone.key, size: zone.threads.length })),
       this.plotCells
     )
     // Remembered, not replaced: a project that has just lost its last thread keeps its
@@ -362,17 +447,22 @@ export class Colony {
       this.plots.delete(name)
     }
 
-    projects.forEach(([name], index) => {
-      if (this.plots.has(name)) return
-      const cells = layout.get(name)
+    ;[...zones.values()].forEach((zone, index) => {
+      const key = zone.key
+      if (this.plots.has(key)) return
+      const cells = layout.get(key)
       if (!cells?.length) return
-      const accent = this._pickAccent(name)
-      const plot = new Plot({ id: name, name, index, cells, accent })
-      plot.signature = wanted.get(name)
-      this.plots.set(name, plot)
+      const accent = this._pickAccent(key)
+      // `id` is what the layout remembers and what everything else addresses a zone by;
+      // `name` is only ever read by a human, so a split zone carries its repo *and* the
+      // kind of work on it.
+      const plot = new Plot({ id: key, name: zone.label, index, cells, accent })
+      plot.project = zone.project
+      plot.signature = wanted.get(key)
+      this.plots.set(key, plot)
       this.plotGroup.add(plot.group)
 
-      const label = createLabel(name, accent)
+      const label = createLabel(zone.label, accent)
       label.position.set(plot.labelAnchor.x, 3.2, plot.labelAnchor.z)
       plot.label = label
       this.labelGroup.add(label)

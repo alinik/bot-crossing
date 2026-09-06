@@ -15,7 +15,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { exists, jsonLines, listDirs, listFiles, num, readHead } from '../lib/fsutil.mjs'
+import { exists, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
 
 const execFileAsync = promisify(execFile)
 const HOME = os.homedir()
@@ -79,12 +79,16 @@ function cleanPrompt(s) {
  * Mirrors the CLI's own title precedence: custom > ai > summary > first prompt.
  */
 function readTranscriptMeta(records) {
-  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0 }
+  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0, model: '' }
   for (const r of records) {
     if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
     if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
     if (!meta.summary && r.type === 'summary' && r.summary) meta.summary = r.summary
     if (!meta.cwd && r.cwd) meta.cwd = r.cwd
+    // Which model answered. The desktop app records this itself, but a thread run from the
+    // terminal and every subagent have no record at all — their transcript is the only place
+    // it is written down.
+    if (!meta.model && r.type === 'assistant' && r.message?.model) meta.model = r.message.model
     if (!meta.gitBranch && r.gitBranch && r.gitBranch !== 'HEAD') meta.gitBranch = r.gitBranch
     if (!meta.startedAt && r.timestamp) {
       const t = Date.parse(r.timestamp)
@@ -141,6 +145,77 @@ async function scanTranscripts() {
     }
   }
   return byId
+}
+
+/** How much of a transcript's end it takes to see whose turn it is. One record is plenty. */
+const TAIL_BYTES = 64 * 1024
+
+/**
+ * Whether a transcript ends with the turn handed back to you.
+ *
+ * A live process is not the same thing as work in progress. The CLI holds its process open
+ * while it sits at the prompt, so "the pid exists and the file moved recently" marks a thread
+ * that finished four minutes ago and asked you a question as *working* — an astronaut
+ * hammering away at a thread whose whole point is that it is waiting.
+ *
+ * The transcript says which it is. A turn that ended with an `end_turn` assistant message is
+ * over and the reply is yours to make; anything else — a `tool_use` stop, a tool result, a
+ * user record — is work still moving. This reads the tail rather than the whole file, and
+ * only for threads that could plausibly be running, so it costs one small read each.
+ */
+async function awaitingReply(file) {
+  let records
+  try {
+    records = jsonLines(await readTail(file, TAIL_BYTES))
+  } catch {
+    return false
+  }
+  for (let i = records.length - 1; i >= 0; i--) {
+    const r = records[i]
+    // A user turn, a tool result or an attachment all mean the model is expected to speak
+    // next — whatever the process is doing, it is not waiting on anyone.
+    if (r.type === 'user') return false
+    if (r.type !== 'assistant') continue
+    const content = r.message?.content
+    const calling = Array.isArray(content) && content.some((c) => c?.type === 'tool_use')
+    // Mid-turn is a tool call, and that is the reliable half: `stop_reason` is `end_turn` on
+    // a main thread's last message but empty on a subagent's, so a message that called
+    // nothing and was answered by nothing is the end of the turn either way.
+    return !calling && r.message?.stop_reason !== 'tool_use'
+  }
+  return false
+}
+
+/**
+ * Every subagent transcript on disk, keyed by the thread id the colony will know it as.
+ *
+ * A subagent gets its own transcript, one directory deeper than a thread's:
+ * `~/.claude/projects/<project>/<parentSessionId>/subagents/agent-<id>.jsonl`. The parent's
+ * own transcript records only that it spawned one, so a fan-out of ten reads as a single
+ * busy thread unless these are scanned too.
+ */
+async function scanSubagentTranscripts() {
+  const out = new Map()
+  for (const projectDir of await listDirs(CLI_PROJECTS)) {
+    for (const sessionDir of await listDirs(projectDir)) {
+      const parentId = path.basename(sessionDir)
+      if (!UUID.test(parentId)) continue
+      for (const file of await listFiles(path.join(sessionDir, 'subagents'), (n) => n.endsWith('.jsonl'))) {
+        const agentId = path.basename(file, '.jsonl')
+        let stat
+        try {
+          stat = await fsp.stat(file)
+        } catch {
+          continue
+        }
+        // Keyed by parent as well as by agent: the agent id is a hash, and one that repeated
+        // across two threads would otherwise take the other's place in the map.
+        const id = `${parentId}:${agentId}`
+        out.set(id, { id, agentId, parentId, file, projectDir, size: stat.size, mtime: stat.mtimeMs })
+      }
+    }
+  }
+  return out
 }
 
 /** Transcript metadata is expensive to parse, so keep it until the file changes. */
@@ -241,12 +316,34 @@ function mergeThread(existing, next) {
  * id looks like.
  */
 function toThread(t) {
-  const { desktopSessionId, desktopSessionIds, cliSessionId, bridgeSessionId, titled, hasLiveProcess, ...rest } = t
+  const {
+    desktopSessionId,
+    desktopSessionIds,
+    cliSessionId,
+    bridgeSessionId,
+    titled,
+    hasLiveProcess,
+    transcriptFile,
+    recordActivityAt,
+    parentDesktopId,
+    parentCliId,
+    ...rest
+  } = t
+  const openable = (desktop, cli) => Boolean((desktop && DESKTOP_ID.test(desktop)) || (cli && UUID.test(cli)))
   return {
     ...rest,
-    canOpen: Boolean((desktopSessionId && DESKTOP_ID.test(desktopSessionId)) || (cliSessionId && UUID.test(cliSessionId))),
-    canArchive: desktopSessionIds.length > 0,
+    // A subagent opens its parent — there is no session of its own to resume — and cannot be
+    // archived at all: it has no record to flag, and it is not yours to retire. The thread
+    // that spawned it owns its lifetime, and archiving that takes its workers with it.
+    canOpen: t.subagent ? openable(parentDesktopId, parentCliId) : openable(desktopSessionId, cliSessionId),
+    // Every real thread can be retired, including one the desktop app has never heard of:
+    // a terminal-only session has no record to flag, so archiving it is recorded in the
+    // colony alone — which is the whole reason the colony keeps a list of its own.
+    canArchive: !t.subagent,
     ref: { desktopSessionId, desktopSessionIds, cliSessionId },
+    ...(t.subagent
+      ? { parentRef: { desktopSessionId: parentDesktopId || '', desktopSessionIds: [], cliSessionId: parentCliId || '' } }
+      : {}),
   }
 }
 
@@ -256,6 +353,7 @@ async function scanThreads() {
     scanTranscripts(),
     scanLiveSessions(),
   ])
+  const subagents = await scanSubagentTranscripts()
   const byId = new Map()
   const add = (thread) => {
     const existing = byId.get(thread.id)
@@ -286,10 +384,23 @@ async function scanThreads() {
       worktree,
       cwd,
       gitBranch: meta?.gitBranch || '',
-      model: s.model || '',
+      model: s.model || meta?.model || '',
       effort: s.effort || '',
       createdAt: num(s.createdAt) || meta?.startedAt || 0,
-      lastActivityAt: num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
+      // The desktop record's own timestamp lags: the app writes it when the thread is
+      // focused, so a session running in a terminal — or in a window you are not looking at
+      // — reads as hours old while its transcript is being written to right now. Whichever
+      // of the two is later is the truth about when the thread last did anything.
+      lastActivityAt: Math.max(
+        num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
+        entry?.mtime || 0
+      ),
+      // The record's own timestamp, kept apart from the one above. "Unread" is a comparison
+      // against when you last *looked*, and both sides of it have to come from the app's own
+      // bookkeeping: measure the transcript's mtime against `lastFocusedAt` instead and every
+      // thread whose file was touched after you last opened it — a resumed CLI session, a
+      // background write — reads as unread, which puts a `?` over half the colony.
+      recordActivityAt: num(s.lastActivityAt) || num(s.lastFocusedAt) || num(s.createdAt) || 0,
       lastFocusedAt: num(s.lastFocusedAt),
       hasLiveProcess: live.has(cliSessionId),
       hasError: Boolean(s.error),
@@ -299,6 +410,7 @@ async function scanThreads() {
       archived: s.isArchived === true || s.isArchived === 'True',
       hasTranscript: Boolean(entry),
       sizeBytes: entry?.size || 0,
+      transcriptFile: entry?.file || '',
       source: 'desktop',
     })
   }
@@ -323,7 +435,7 @@ async function scanThreads() {
       worktree,
       cwd,
       gitBranch: meta.gitBranch,
-      model: '',
+      model: meta.model || '',
       effort: '',
       createdAt: meta.startedAt || entry.mtime,
       lastActivityAt: entry.mtime,
@@ -336,17 +448,117 @@ async function scanThreads() {
       archived: false,
       hasTranscript: true,
       sizeBytes: entry.size,
+      transcriptFile: entry.file,
       source: 'cli',
     })
   }
 
-  const threads = [...byId.values()]
+  // Subagents. One per `Agent` call the parent made, standing on the parent's own zone —
+  // see `zonesFor`. They are read-only: there is no session to reopen and nothing to archive,
+  // since the thing that owns them is the thread that spawned them.
+  for (const [id, entry] of subagents) {
+    const meta = await transcriptMeta(entry)
+    const cwd = meta.cwd || decodeProjectDir(path.basename(entry.projectDir))
+    const { projectPath, project, worktree } = projectOf(cwd, '')
+    add({
+      id,
+      cliSessionId: '',
+      desktopSessionId: '',
+      desktopSessionIds: [],
+      titled: false,
+      bridgeSessionId: '',
+      title: meta.firstPrompt ? meta.firstPrompt.slice(0, 90) : 'Subagent',
+      preview: meta.firstPrompt ? meta.firstPrompt.slice(0, 240) : '',
+      project,
+      projectPath,
+      worktree,
+      cwd,
+      gitBranch: meta.gitBranch,
+      model: meta.model || '',
+      effort: '',
+      createdAt: meta.startedAt || entry.mtime,
+      lastActivityAt: entry.mtime,
+      lastFocusedAt: 0,
+      // A subagent has no entry in the live registry — it runs inside its parent's process,
+      // so the parent being alive is what makes it capable of running at all.
+      hasLiveProcess: live.has(entry.parentId),
+      hasError: false,
+      starred: false,
+      routine: '',
+      prState: '',
+      archived: false,
+      hasTranscript: true,
+      sizeBytes: entry.size,
+      transcriptFile: entry.file,
+      source: 'subagent',
+      subagent: true,
+      parentId: entry.parentId,
+    })
+  }
+
+  /**
+   * A subagent stands where its *parent* does.
+   *
+   * Its transcript knows only the directory it ran in, and that is routinely not the repo:
+   * `/fix` works inside a scratch worktree, a triage run works out of a state folder. Taking
+   * the basename of that gives a project nobody has ever heard of — `sentry-bc-withdraw-…`
+   * beside `withdraw-bc`, `.triage` beside `PycharmProjects` — so the fan-out lands on a zone
+   * of its own next to the thread that spawned it, which is precisely the thing worth seeing
+   * broken in two. The parent knows better: the desktop record carries the repo it was opened
+   * against, whatever directory the work wandered into.
+   */
+  for (const thread of byId.values()) {
+    if (!thread.subagent) continue
+    const parent = byId.get(thread.parentId)
+    if (!parent) continue
+    thread.project = parent.project
+    thread.projectPath = parent.projectPath
+    thread.worktree = parent.worktree
+    // What "open" means for a worker: the thread that spawned it. Kept apart from the
+    // subagent's own (empty) `ref` on purpose — that ref is what archiving writes through,
+    // and pointing it at the parent would archive the parent from a click on its worker.
+    thread.parentDesktopId = parent.desktopSessionId || ''
+    thread.parentCliId = parent.cliSessionId || ''
+  }
+
+  const now = Date.now()
+  /**
+   * Drop the app's empty bookkeeping records.
+   *
+   * Resuming a thread makes the desktop app write a second record for the same
+   * conversation, and one of those two carries the title and the transcript link while the
+   * other carries nothing. When the empty one has no `cliSessionId` there is no key to
+   * merge the pair on, so it survives as a thread of its own: an untitled entry with no
+   * transcript behind it. Archiving the real thread does not touch it — the ids in `ref`
+   * are the ones the real record named — so an archived conversation appears to come back
+   * as a nameless twin, which is exactly what it looks like from the colony.
+   *
+   * A record with no transcript, no title and no live process is not a conversation. The
+   * age check is what keeps a genuinely new session — opened seconds ago, nothing written
+   * yet — from being swept up with them.
+   */
+  const NEW_SESSION_MS = 10 * 60 * 1000
+  const threads = [...byId.values()].filter(
+    (t) =>
+      t.hasTranscript ||
+      t.titled ||
+      t.hasLiveProcess ||
+      now - (t.lastActivityAt || t.createdAt || 0) < NEW_SESSION_MS
+  )
   // Unread = the thread moved on after you last looked at it; never opened counts as unread.
   // Terminal-only threads have no focus history at all, so "unread" is unknowable — not true.
-  const now = Date.now()
   for (const thread of threads) {
-    thread.unread = thread.desktopSessionIds.length > 0 && thread.lastActivityAt > thread.lastFocusedAt
-    thread.running = thread.hasLiveProcess && now - thread.lastActivityAt < ACTIVE_WINDOW_MS
+    const seenAt = thread.recordActivityAt ?? thread.lastActivityAt
+    thread.unread = thread.desktopSessionIds.length > 0 && seenAt > thread.lastFocusedAt
+    const fresh = now - thread.lastActivityAt < ACTIVE_WINDOW_MS
+    // Only threads that could plausibly be working pay for the tail read.
+    const waiting =
+      thread.hasLiveProcess && fresh && thread.transcriptFile ? await awaitingReply(thread.transcriptFile) : false
+    thread.running = thread.hasLiveProcess && fresh && !waiting
+    // A thread that handed the turn back wants you, whether or not the desktop app has ever
+    // seen it — which is the only way a terminal-only thread can ask for anything at all.
+    // A subagent cannot: nobody replies to a worker, it simply stops.
+    if (waiting && !thread.subagent) thread.unread = true
   }
   return threads.map(toThread)
 }
@@ -493,6 +705,168 @@ async function windowsAppStartedAt() {
   return main && !Number.isNaN(main.when) ? main.when : 0
 }
 
+/** Where the CLI caches what the account has spent of its limits. */
+const CLI_CONFIG = path.join(HOME, '.claude.json')
+
+/**
+ * Where `ccstatusline` caches the same thing.
+ *
+ * It is a status-line widget a lot of people already run, and it asks the API itself — with
+ * the account's own OAuth token, on a three-minute cache. The CLI's copy is refreshed only
+ * when Claude Code happens to talk to the API, which in practice means it can be hours out:
+ * measured side by side, the CLI said 34% of the session was spent while the live answer was
+ * 92%. So if this file is here and fresher, it wins.
+ *
+ * Nothing here fetches anything. Reading a cache another tool on this machine already wrote
+ * is the same bargain as reading the harness's own session files.
+ */
+const CCSTATUSLINE_CACHE = path.join(HOME, '.cache', 'ccstatusline', 'usage.json')
+
+/** Human names for the limit windows the config reports. */
+const LIMIT_LABELS = { session: 'Session', weekly_all: 'Weekly', weekly_scoped: 'Weekly' }
+
+let usageCache = { mtime: 0, value: null }
+let statuslineCache = { mtime: 0, value: null }
+
+/**
+ * How much of the account's limits is left, as Claude Code itself last saw it.
+ *
+ * Claude Code writes what the API told it into `~/.claude.json` under
+ * `cachedUsageUtilization`, and that is the only place this exists locally — the colony has
+ * no account of its own and asks nobody. It is a *cache*: the CLI refreshes it when it talks
+ * to the API, so it can be hours old, which is why `fetchedAt` comes back with it. Anything
+ * showing this has to show its age too, or it is quietly lying.
+ *
+ * Percentages, not tokens: what the API reports is a percentage of the window used, and no
+ * token figure exists anywhere on disk to convert it from.
+ */
+/**
+ * `ccstatusline`'s own cache, if it is on this machine. Its file has no timestamp inside it,
+ * so the mtime is the reading's age — which is exactly what it is, since the tool rewrites the
+ * file each time it refreshes.
+ */
+async function statuslineUsage() {
+  let stat
+  try {
+    stat = await fsp.stat(CCSTATUSLINE_CACHE)
+  } catch {
+    return null
+  }
+  if (statuslineCache.mtime === stat.mtimeMs) return statuslineCache.value
+
+  let raw
+  try {
+    raw = JSON.parse(await fsp.readFile(CCSTATUSLINE_CACHE, 'utf8'))
+  } catch {
+    return null
+  }
+
+  const windows = [
+    { kind: 'session', label: 'Session', used: raw.sessionUsage, resets: raw.sessionResetAt, scope: '' },
+    { kind: 'weekly_all', label: 'Weekly', used: raw.weeklyUsage, resets: raw.weeklyResetAt, scope: '' },
+    { kind: 'weekly_scoped', label: 'Weekly', used: raw.weeklyOpusUsage, resets: raw.weeklyOpusResetAt, scope: 'Opus' },
+    { kind: 'weekly_scoped', label: 'Weekly', used: raw.weeklySonnetUsage, resets: raw.weeklySonnetResetAt, scope: 'Sonnet' },
+  ]
+
+  const limits = windows
+    // A *scoped* window with no reset time is one the account does not have. The session and
+    // weekly windows always exist, and one of them arrives with no reset the moment it rolls
+    // over — a five-hour window has not started again until you next send something — so they
+    // are kept and shown as not started rather than vanishing off the panel.
+    .filter((w) => typeof w.used === 'number' && (w.resets || w.kind !== 'weekly_scoped'))
+    .map((w) => ({
+      kind: w.kind,
+      group: w.kind === 'session' ? 'session' : 'weekly',
+      label: w.label,
+      used: Math.min(100, Math.max(0, Math.round(w.used))),
+      severity: w.used >= 90 ? 'critical' : w.used >= 75 ? 'warning' : 'normal',
+      resetsAt: Date.parse(w.resets) || 0,
+      scope: w.scope,
+    }))
+
+  const value = limits.length ? { fetchedAt: Math.round(stat.mtimeMs), limits, source: 'ccstatusline' } : null
+  statuslineCache = { mtime: stat.mtimeMs, value }
+  return value
+}
+
+async function cliConfigUsage() {
+  let stat
+  try {
+    stat = await fsp.stat(CLI_CONFIG)
+  } catch {
+    return null
+  }
+  if (usageCache.mtime === stat.mtimeMs) return usageCache.value
+
+  let cached
+  try {
+    cached = JSON.parse(await fsp.readFile(CLI_CONFIG, 'utf8')).cachedUsageUtilization
+  } catch {
+    return null
+  }
+  const limits = cached?.utilization?.limits
+  if (!Array.isArray(limits)) return null
+
+  const value = {
+    fetchedAt: num(cached.fetchedAtMs) || 0,
+    source: 'claude-code',
+    limits: limits
+      // Same rule as above: a scoped window needs a reset time to be real; the session and
+      // weekly ones are kept through the moment they roll over.
+      .filter((l) => l && typeof l.percent === 'number' && (l.resets_at || l.kind !== 'weekly_scoped'))
+      .map((l) => ({
+        kind: l.kind || '',
+        group: l.group || '',
+        label: LIMIT_LABELS[l.kind] || l.kind || 'Limit',
+        used: Math.min(100, Math.max(0, Math.round(l.percent))),
+        severity: l.severity || 'normal',
+        resetsAt: Date.parse(l.resets_at) || 0,
+        // `weekly_scoped` is per model — "Weekly · Opus" rather than a second "Weekly".
+        scope: l.scope?.model?.display_name || '',
+      })),
+  }
+  usageCache = { mtime: stat.mtimeMs, value }
+  return value
+}
+
+/**
+ * The freshest reading of the account's limits that exists on this machine.
+ *
+ * Merged *per window* rather than by picking one source outright. Neither cache is
+ * authoritative and neither is complete: right after a five-hour window rolls over,
+ * ccstatusline's file stops mentioning the session at all while the CLI's copy still has it,
+ * and taking the newer file wholesale would drop the row off the panel. So each window comes
+ * from the most recent source that actually reports it, and each carries the age of the
+ * reading it came from.
+ *
+ * Percentages of each window *spent*, not tokens: no token figure exists in either source to
+ * convert from.
+ */
+async function usage() {
+  const sources = (await Promise.all([statuslineUsage(), cliConfigUsage()]))
+    .filter(Boolean)
+    .sort((a, b) => b.fetchedAt - a.fetchedAt)
+  if (!sources.length) return null
+
+  const merged = new Map()
+  for (const source of sources) {
+    for (const limit of source.limits) {
+      const key = `${limit.kind}\u0000${limit.scope}`
+      if (merged.has(key)) continue
+      merged.set(key, { ...limit, source: source.source, fetchedAt: source.fetchedAt })
+    }
+  }
+
+  const limits = [...merged.values()]
+  return {
+    // The panel says how old the reading is, so it has to be the *oldest* contributing one —
+    // the freshest would flatter a row that is actually hours out of date.
+    fetchedAt: Math.min(...limits.map((l) => l.fetchedAt)),
+    source: [...new Set(limits.map((l) => l.source))].join(' + '),
+    limits,
+  }
+}
+
 export default {
   id: 'claude-code',
   name: 'Claude Code',
@@ -503,5 +877,6 @@ export default {
   newSession,
   setArchived,
   appStartedAt,
+  usage,
   paths: { DESKTOP_SESSIONS, CLI_PROJECTS, CLI_LIVE },
 }

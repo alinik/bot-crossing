@@ -133,6 +133,16 @@ const DEFAULTS = {
   iblIntensity: 1.0,
   fov: 38,
 
+  // Who shows up
+  //
+  // The colony is not a thread list: a session you have not touched in half an hour is over,
+  // and drawing it costs a tile, a building and a body that all say nothing. These two decide
+  // who earns a place on the surface — everyone else is still scanned, and walks back out of
+  // the ship the moment anything touches them.
+  crewFilter: 'active', // 'active' — working, asking for you, or touched inside the idle window; or 'all'
+  idleWindow: 30, // minutes of silence before a thread counts as dormant, and drops out of 'active'
+  splitAt: 12, // threads on one repo before it splits into a zone per task type; 0 never splits
+
   // Behaviour
   autoQuality: true, // drop render scale when frames get expensive
   autoFrame: false, // ease the camera back to isometric when you stop dragging; opt-in

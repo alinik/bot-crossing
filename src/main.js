@@ -11,6 +11,7 @@ import { crewRig, loadCrew } from './agents/crew.js'
 import { TIMES } from './world/sky.js'
 import {
   fetchThreads,
+  fetchUsage,
   fetchState,
   saveState,
   openThread,
@@ -47,7 +48,7 @@ const engine = new Engine(settings).mount(app)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {} }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, ignored: [] }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -114,14 +115,14 @@ const actions = {
     select(agent.id, { fly: true })
   },
 
-  focusProject: (name) => {
-    const plot = colony.plots.get(name)
+  focusProject: (id) => {
+    const plot = colony.plots.get(id)
     if (!plot) return
     rig.focus(plot.middle || plot.center, { distance: 30 })
   },
 
-  /** The legend, and anything else that means "show me this repo". */
-  pickProject: (name) => selectProject(name, { fly: true }),
+  /** The legend, and anything else that means "show me this zone". */
+  pickProject: (id) => selectProject(id, { fly: true }),
 
   /** Back out of one repo to the list of all of them. The panel itself never leaves. */
   closeProject: () => {
@@ -139,16 +140,19 @@ const actions = {
    * its workspace — nothing here is resumed, and nothing is written to disk.
    */
   newConversation: async () => {
-    const name = selectedProject
-    const folder = name && pathForProject(name)
+    const id = selectedProject
+    const folder = id && pathForProject(id)
     if (!folder) {
       hud.toast('No folder on disk for that project', 'err')
       return
     }
     try {
-      const harness = harnessForProject(name)
+      const harness = harnessForProject(id)
       await newSession(folder, harness)
-      hud.toast(`New thread in ${name} — opening ${harnessLabel(harness)}`)
+      // Named by the repo rather than the zone: a new thread starts in a folder, and which
+      // slice of that folder it ends up on is not decided until it has a title.
+      const repo = colony.plots.get(id)?.project || id
+      hud.toast(`New thread in ${repo} — opening ${harnessLabel(harness)}`)
       // It lands as an astronaut walking down the ramp, once it has a record to scan.
       setTimeout(poll, 6000)
     } catch (err) {
@@ -194,9 +198,64 @@ const actions = {
     }
   },
 
+  /**
+   * Drop a repo off the map for good — a scratch folder, a bot's own workspace, anything
+   * whose threads are noise rather than work. Archiving each thread would not do: the next
+   * one that repo produces would put the zone straight back.
+   */
+  ignoreProject: () => {
+    const plot = selectedProject ? colony.plots.get(selectedProject) : null
+    const repo = plot?.project
+    if (!repo) return
+    state.ignored = [...new Set([...(state.ignored || []), repo])]
+    queueSave()
+    select(null, {})
+    actions.closeProject()
+    applyThreads(threads)
+    hud.toast(`${repo} is off the map — bring it back under Who shows up`)
+  },
+
+  /**
+   * Un-archive a thread. The one gesture that was missing: archiving wrote to the colony's
+   * list *and* to the harness's own record, and nothing anywhere could undo either — an `A`
+   * pressed by accident took a live thread off the map for good.
+   */
+  restoreThread: async (id) => {
+    const thread = threads.find((t) => t.id === id)
+    state.archived = state.archived.filter((x) => x !== id)
+    const { [id]: _dropped, ...rest } = state.archivedAt || {}
+    state.archivedAt = rest
+    queueSave()
+    // The harness's own flag is best-effort, exactly as it is when archiving: the colony's
+    // list is the authority, and a thread the app has no record for is fine either way.
+    if (thread) {
+      try {
+        await archiveThread(thread, false)
+      } catch {
+        /* the colony has already let it go; the app's flag catches up or does not */
+      }
+    }
+    applyThreads(threads)
+    hud.toast(thread ? `${shortTitle(thread)} is back` : 'Restored')
+    poll()
+  },
+
+  /** Put an ignored repo back. Its zone returns to the ground it was on. */
+  restoreProject: (repo) => {
+    state.ignored = (state.ignored || []).filter((n) => n !== repo)
+    queueSave()
+    applyThreads(threads)
+    hud.toast(`${repo} is back`)
+  },
+
   archiveThread: async () => {
     const thread = threads.find((t) => t.id === selectedId)
     if (!thread) return
+    // Also reachable from the keyboard, so the rule lives here rather than only on the button.
+    if (thread.canArchive === false) {
+      hud.toast(thread.subagent ? 'A worker is retired by its parent, not on its own' : 'Nothing to archive there')
+      return
+    }
     try {
       const res = await archiveThread(thread, true)
       state.archived = [...new Set([...state.archived, thread.id])]
@@ -247,7 +306,8 @@ function select(id, { fly = false } = {}) {
   const thread = threads.find((t) => t.id === id) || agent.thread
   hud.setSelection(agent, thread)
   // Picking somebody is also picking the zone they are standing on: the sidebar follows.
-  if (thread?.project && colony.plots.has(thread.project)) selectedProject = thread.project
+  const zone = thread ? colony.zoneOf?.get(thread.id) : null
+  if (zone && colony.plots.has(zone)) selectedProject = zone
   syncProject()
   if (fly) {
     rig.focus(new THREE.Vector3(agent.pos.x, 0, agent.pos.z), { distance: Math.min(rig.desiredDistance, 26) })
@@ -255,13 +315,13 @@ function select(id, { fly = false } = {}) {
 }
 
 /** Open a zone's sidebar. Any selected astronaut from a different zone lets go. */
-function selectProject(name, { fly = false } = {}) {
-  if (!name || !colony.plots.has(name)) return
-  selectedProject = name
+function selectProject(id, { fly = false } = {}) {
+  if (!id || !colony.plots.has(id)) return
+  selectedProject = id
   const current = threads.find((t) => t.id === selectedId)
-  if (current && current.project !== name) select(null, {})
+  if (current && colony.zoneOf?.get(current.id) !== id) select(null, {})
   else syncProject()
-  if (fly) actions.focusProject(name)
+  if (fly) actions.focusProject(id)
 }
 
 /**
@@ -282,10 +342,10 @@ function harnessLabel(id) {
  * common answer among the threads standing there. A repo worked on from two harnesses gets
  * a new thread in whichever one it is mostly used from.
  */
-function harnessForProject(name) {
+function harnessForProject(id) {
   const counts = new Map()
   for (const thread of colony.threads.values()) {
-    if (thread.project !== name || !thread.harness) continue
+    if (colony.zoneOf?.get(thread.id) !== id || !thread.harness) continue
     counts.set(thread.harness, (counts.get(thread.harness) ?? 0) + 1)
   }
   let best = ''
@@ -298,10 +358,10 @@ function harnessForProject(name) {
   return best
 }
 
-function pathForProject(name) {
+function pathForProject(id) {
   const counts = new Map()
   for (const thread of colony.threads.values()) {
-    if (thread.project !== name) continue
+    if (colony.zoneOf?.get(thread.id) !== id) continue
     const dir = thread.projectPath || thread.cwd
     if (!dir) continue
     counts.set(dir, (counts.get(dir) ?? 0) + 1)
@@ -327,13 +387,13 @@ function syncProject() {
   }
   const now = Date.now()
   const list = [...colony.threads.values()]
-    .filter((thread) => thread.project === plot.name)
+    .filter((thread) => colony.zoneOf?.get(thread.id) === plot.id)
     .map((thread) => ({
       id: thread.id,
       title: thread.title,
       worktree: thread.worktree,
       lastActivityAt: thread.lastActivityAt,
-      status: statusFor(thread, now),
+      status: statusFor(thread, now, colony.staleMs),
     }))
     // Whoever wants something first, then most recently touched — the same order of
     // importance the badges use above their heads.
@@ -343,9 +403,11 @@ function syncProject() {
     })
 
   hud.setProject({
+    // The id addresses the zone; the name is only ever read.
+    id: plot.id,
     name: plot.name,
     accent: plot.accent,
-    path: pathForProject(plot.name),
+    path: pathForProject(plot.id),
     threads: list,
     selectedId,
   })
@@ -426,7 +488,7 @@ engine.canvas.addEventListener('pointerup', (e) => {
   // Nobody there: a zone's deck or its name plate opens that repo's sidebar instead, and
   // bare ground puts everything down.
   const plot = plotUnder(e, p)
-  if (plot) selectProject(plot.name, {})
+  if (plot) selectProject(plot.id, {})
   else {
     select(null, {})
     actions.closeProject()
@@ -538,17 +600,54 @@ window.addEventListener('keydown', (e) => {
 
 // ── data ──────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A thread's title, trimmed to something a one-line row can hold. Skill threads open with the
+ * skill's own preamble, so an untrimmed title is a paragraph.
+ */
+function shortTitle(thread) {
+  const title = (thread.title || 'Untitled thread').replace(/\s+/g, ' ').trim()
+  return title.length > 52 ? `${title.slice(0, 51)}…` : title
+}
+
 function applyThreads(list) {
   threads = list
+
+  /**
+   * Anything worked on since you archived it comes off the list — the scanner spots that and
+   * says so, and the page is the one writer of the file, so the forgetting happens here.
+   */
+  const revived = list.filter((t) => t.unarchivedByActivity && state.archived.includes(t.id))
+  if (revived.length) {
+    const back = new Set(revived.map((t) => t.id))
+    state.archived = state.archived.filter((id) => !back.has(id))
+    state.archivedAt = Object.fromEntries(Object.entries(state.archivedAt || {}).filter(([id]) => !back.has(id)))
+    queueSave()
+    hud.toast(
+      revived.length === 1
+        ? `${shortTitle(revived[0])} is active again — back on the map`
+        : `${revived.length} threads are active again — back on the map`
+    )
+  }
+
   const archivedSet = new Set(state.archived)
-  const stats = colony.setThreads(list, archivedSet)
+  // Ignored repos never reach the colony at all: not a zone, not a count, not a thread in
+  // the sidebar. They are still scanned, so un-ignoring one brings its threads straight back.
+  const ignored = new Set(state.ignored || [])
+  const stats = colony.setThreads(
+    ignored.size ? list.filter((t) => !ignored.has(t.project)) : list,
+    archivedSet
+  )
   hud.setStats(stats)
 
   legendProjects = colony.plotOrder
     .map((plot) => ({
+      id: plot.id,
       name: plot.name,
       accent: plot.accent,
-      count: list.filter((t) => !t.archived && !archivedSet.has(t.id) && t.project === plot.name).length,
+      // Counted straight off the zone the colony actually put each thread on: a chip
+      // claiming four when three astronauts stand there reads as a bug, and a split repo
+      // makes that easy to get wrong.
+      count: [...colony.threads.values()].filter((t) => colony.zoneOf?.get(t.id) === plot.id).length,
       urgent: colony.urgentPlots?.has(plot.id) ?? false,
     }))
     .sort((a, b) => b.count - a.count)
@@ -559,6 +658,20 @@ function applyThreads(list) {
     if (still) hud.setSelection(still, list.find((t) => t.id === selectedId) || still.thread)
     else select(null, {})
   }
+  hud.setIgnored(state.ignored || [])
+  // What you archived, newest first — the only route back onto the map.
+  const archivedList = list
+    .filter((t) => archivedSet.has(t.id))
+    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0))
+  hud.setArchived({
+    total: archivedList.length,
+    rows: archivedList.slice(0, 12).map((t) => ({
+      id: t.id,
+      title: shortTitle(t),
+      project: t.project,
+      lastActivityAt: t.lastActivityAt,
+    })),
+  })
   // Which also repaints the legend, so the open zone's chip is lit by the same pass.
   syncProject()
 
@@ -581,6 +694,14 @@ async function poll() {
     const res = await fetchThreads()
     applyThreads(res.threads || [])
     hud.removeBoot()
+    // Limits ride along with the thread poll: the reading is a cache the harness refreshes on
+    // its own schedule, so asking more often than this would buy nothing.
+    try {
+      const usage = await fetchUsage()
+      hud.setUsage(usage.usage?.[0] || null)
+    } catch {
+      /* the colony does not depend on this; an unreachable endpoint just shows nothing */
+    }
   } catch (err) {
     hud.toast(err.message || 'Could not reach the thread scanner', 'err')
     hud.removeBoot()
@@ -656,7 +777,16 @@ settings.onChange((changed, scope) => {
   if (scope.render || changed.has('fov')) engine.applySettings()
   colony.onSettingsChanged(changed, scope)
   if (changed.has('showFps')) hud.syncSettings()
-  if (changed.has('maxAgents')) applyThreads(threads)
+  // Who shows up is a pure function of the thread list and these, so a change to any of them
+  // redraws the colony from the list already in hand rather than waiting for a poll.
+  if (
+    changed.has('maxAgents') ||
+    changed.has('idleWindow') ||
+    changed.has('crewFilter') ||
+    changed.has('splitAt')
+  ) {
+    applyThreads(threads)
+  }
 })
 
 // ── frame ─────────────────────────────────────────────────────────────────────────────
