@@ -79,12 +79,16 @@ function cleanPrompt(s) {
  * Mirrors the CLI's own title precedence: custom > ai > summary > first prompt.
  */
 function readTranscriptMeta(records) {
-  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0 }
+  const meta = { customTitle: '', aiTitle: '', summary: '', firstPrompt: '', cwd: '', gitBranch: '', startedAt: 0, model: '' }
   for (const r of records) {
     if (!meta.customTitle && r.customTitle) meta.customTitle = r.customTitle
     if (!meta.aiTitle && r.aiTitle) meta.aiTitle = r.aiTitle
     if (!meta.summary && r.type === 'summary' && r.summary) meta.summary = r.summary
     if (!meta.cwd && r.cwd) meta.cwd = r.cwd
+    // Which model answered. The desktop app records this itself, but a thread run from the
+    // terminal and every subagent have no record at all — their transcript is the only place
+    // it is written down.
+    if (!meta.model && r.type === 'assistant' && r.message?.model) meta.model = r.message.model
     if (!meta.gitBranch && r.gitBranch && r.gitBranch !== 'HEAD') meta.gitBranch = r.gitBranch
     if (!meta.startedAt && r.timestamp) {
       const t = Date.parse(r.timestamp)
@@ -431,7 +435,7 @@ async function scanThreads() {
       worktree,
       cwd,
       gitBranch: meta.gitBranch,
-      model: '',
+      model: meta.model || '',
       effort: '',
       createdAt: meta.startedAt || entry.mtime,
       lastActivityAt: entry.mtime,

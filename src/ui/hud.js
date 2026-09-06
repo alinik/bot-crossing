@@ -3,6 +3,7 @@ import { PLANETS } from '../world/planet.js'
 import { TIMES } from '../world/sky.js'
 import { STATUS_LABEL } from '../game/colony.js'
 import { FACE, FRAME_COLS, FRAME_ROWS } from '../agents/faces.js'
+import { MODEL_COLOURS, helmetFor } from '../agents/astronauts.js'
 
 /**
  * The whole HUD, in plain DOM.

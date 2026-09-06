@@ -28,6 +28,48 @@ import { attachMatrixAt, decorateSkinned, frameFor } from './crew.js'
 
 const SUIT_TONES = [0xf3f1ec, 0xe8e4dc, 0xf7f4ee, 0xdfe4e8, 0xf1e9df]
 
+/**
+ * Helmet tint per model family — which model is answering, readable across the map without
+ * clicking anything.
+ *
+ * By family rather than by version: `claude-sonnet-4-6` and `claude-sonnet-5` are the same
+ * thing to anyone glancing at a colony, and a shade per point release would be a palette
+ * nobody could hold in their head. A model nobody has a colour for keeps the suit's own tone,
+ * so an unknown model reads as *unremarkable* rather than as a bug.
+ *
+ * These are helmet colours specifically, so they stay clear of the two things already
+ * carrying meaning: the trim and eyes say what a thread is *doing*, and the body says whether
+ * it is a worker.
+ */
+const MODEL_TINTS = [
+  [/opus/i, 0x8f6ff0],
+  [/sonnet/i, 0x3aa6cc],
+  [/haiku/i, 0x4faf72],
+  [/fable/i, 0xd4589a],
+]
+
+/** The same four, for the HUD — one palette, so a card and a helmet can never disagree. */
+export const MODEL_COLOURS = [
+  ['Opus', 0x8f6ff0],
+  ['Sonnet', 0x3aa6cc],
+  ['Haiku', 0x4faf72],
+  ['Fable', 0xd4589a],
+]
+
+export function helmetFor(model, suit) {
+  if (!model) return suit
+  for (const [test, hex] of MODEL_TINTS) if (test.test(model)) return hex
+  return suit
+}
+
+/**
+ * Subagents wear yellow. The crew's own suits are five shades of off-white, which is what
+ * makes one colour enough to separate a fan-out from the thread that spawned it: at any
+ * zoom the yellow reads as *these belong to that one*, without a badge, a label or anything
+ * else competing with the `?` over a thread that actually wants you.
+ */
+const SUBAGENT_SUIT = 0xe8b93c
+
 /** Trim + eye colour per behaviour. Eyes are pushed past 1.0 so the bloom pass catches them. */
 const AGENT_LOOK = {
   working: { trim: 0x4f9a63, eye: [0.35, 2.5, 1.15] },
@@ -538,6 +580,7 @@ export class Astronauts {
       walkAmp: 0,
       screen: new THREE.Vector3(), // filled by the picker each frame
     }
+    agent.helmet = helmetFor(entry.thread?.model, agent.suit)
     this._applyStatus(agent, entry.status)
     this.agents.push(agent)
     this.byId.set(agent.id, agent)
@@ -546,6 +589,16 @@ export class Astronauts {
 
   _updateAgent(agent, entry) {
     agent.thread = entry.thread
+    // A thread does not usually change species mid-life, but a scan that first saw a
+    // subagent without its parent can, so keep the suit honest rather than only at spawn.
+    const suit = entry.subagent ? SUBAGENT_SUIT : SUIT_TONES[(hash(entry.id) >>> 3) % SUIT_TONES.length]
+    const helmet = helmetFor(entry.thread?.model, suit)
+    if (suit !== agent.suit || helmet !== agent.helmet) {
+      agent.suit = suit
+      agent.helmet = helmet
+      agent.subagent = Boolean(entry.subagent)
+      agent.colorDirty = true
+    }
     if (entry.site) {
       const moved = Math.hypot(entry.site.x - agent.site.x, entry.site.z - agent.site.z) > 0.05
       agent.site.copy(entry.site)
@@ -1158,7 +1211,7 @@ export class Astronauts {
       if (agent.index !== i || agent.colorDirty) {
         agent.colorDirty = false
         crew?.setColorAt(i, c.setHex(agent.suit))
-        helmet.setColorAt(i, c.setHex(agent.suit))
+        helmet.setColorAt(i, c.setHex(agent.helmet))
         pack.setColorAt(i, agent.trim)
         face.setColorAt(i, agent.eye)
         staticDirty = true
