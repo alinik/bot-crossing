@@ -143,14 +143,165 @@ thread can only ever be doing one thing. First match wins:
 | Signal | What the astronaut does | Badge |
 | --- | --- | --- |
 | Errored | Slumps, red eyes, fault light stutters | `!` |
-| Running now | Hammers away at its building, sparks fly | `⚒` |
+| Running now | Hammers away at its building, sparks fly — a live process *mid-turn*, not merely open | `⚒` |
 | PR merged | Jumps, confetti, heart eyes | `✓` |
-| Unread | **Stops and waits on you** | `?` |
-| Nothing for 3 days | Sits down and sleeps, `z` bubbles | — |
+| Handed the turn back | **Stops and waits on you** — unread, or its transcript ends on a finished turn | `?` |
+| Nothing for 30 minutes | Not drawn at all — see **Who shows up** below | — |
 | Anything else | Potters around its plot | — |
 
 Only the states that want something from you get a badge. With most of a real thread list
 sitting quiet, a symbol over every astronaut buries the one `?` that actually matters.
+
+### Running means mid-turn, not merely open
+
+A live process is not the same thing as work in progress. The CLI holds its process open
+while it sits at the prompt, so "the pid exists and the file moved recently" marks a thread
+that finished four minutes ago and asked you a question as *working* — an astronaut hammering
+away at a thread whose whole point is that it is waiting.
+
+So a thread that could be running has the end of its transcript read. A last assistant message
+that called a tool is mid-turn and the astronaut keeps working; one that called nothing has
+handed the turn back, and the astronaut stops and holds up its `?` — including for a
+terminal-only thread, which has no unread flag of its own and could not otherwise ask for
+anything. (`stop_reason` alone will not do it: it is `end_turn` on a main thread's last
+message and empty on a subagent's, so what the message *called* is the reliable half.)
+
+A subagent that has handed its turn back is simply finished; nobody replies to a worker, so it
+goes quiet rather than asking.
+
+One related correction: the desktop app writes a thread's `lastActivityAt` when the thread is
+focused, so a session running in a terminal — or in a window you are not looking at — reads as
+hours old while its transcript is being written to this second. The colony takes whichever of
+the record and the transcript's own mtime is later.
+
+That later timestamp decides freshness and sort order only. Whether a thread is *unread* is
+still the app's own two numbers compared against each other — activity against last focus —
+because a transcript's mtime moves for reasons that have nothing to do with you having looked
+at it, and measuring the file against the focus time puts a `?` over half the colony.
+
+### Taking a repo off the map
+
+Some folders are not work: a bot's own workspace, a scratch directory, a state folder some
+skill writes into. Archiving their threads one by one does nothing — the next thread that
+folder produces puts the zone straight back.
+
+**Ignore this repo**, in the zone's sidebar, drops it entirely: no zone, no crew, no counts,
+nothing in any list. The repo is still scanned, so nothing is lost and nothing is written to
+your harness; the colony simply looks past it. Ignored repos appear as chips under **Who shows
+up**, and clicking one puts it back on the ground it was on.
+
+The list lives in `data/colony.json` next to the layout rather than in browser settings, so
+the choice follows the colony rather than the browser you happened to make it in.
+
+### Helmets say which model
+
+The helmet is tinted by model family — **Opus** violet, **Sonnet** blue, **Haiku** green,
+**Fable** pink — so the mix of models running across the colony reads at a glance, and a thread
+card carries the same swatch beside the model's name.
+
+By family rather than by version: `claude-sonnet-4-6` and `claude-sonnet-5` are the same thing
+to anyone glancing at a map, and a shade per point release is a palette nobody can hold in
+their head. A model with no colour keeps the suit's own off-white, so an unknown model reads as
+unremarkable rather than as a fault.
+
+It is the helmet specifically because the other two channels are taken: trim and eyes say what
+a thread is *doing*, and the body says whether it is a worker. Three independent things, three
+places to read them.
+
+The desktop app records the model itself, but a thread started in a terminal — and every
+subagent — has no record at all, so the model is read from the transcript's own first assistant
+message. That took model coverage from 316 of 538 threads to 532.
+
+### Subagents wear yellow
+
+A thread that fans out with the `Agent` tool gets a crowd rather than a busier astronaut.
+Claude Code writes each subagent its own transcript, one directory deeper than the thread's
+— `~/.claude/projects/<project>/<parentSessionId>/subagents/agent-<id>.jsonl` — so they can
+be scanned the same way, and each one becomes an astronaut in a yellow suit working on its
+parent's zone.
+
+They belong to their parent, not to their own prompt or their own working directory. A
+fan-out lands on the zone the parent is standing on even when the split-by-task-type rules
+would read "adversarially verify this finding" as a review — and it takes the parent's repo
+even when it ran somewhere else, which is the common case: `/fix` works inside a scratch
+worktree and a triage run works out of a state folder, so the directory's own name would put
+`sentry-bc-withdraw-issues-fe770d` on the map next to `withdraw-bc`. That crowd around one
+building *is* the thing worth seeing, and scattering it would lose it.
+
+Its card carries one action: **Open parent**, which opens the thread that spawned it, since a
+worker has no session of its own to resume and its parent is where the work actually happened.
+Archive is off — a worker has no record to flag, and it is not yours to retire. The thread
+that spawned it owns its lifetime: archive the parent and its workers go with it, which is the
+only gesture that retires them. Without that an archived thread would leave its fan-out behind
+as a zone full of orphans, none of which could be archived or lead anywhere. Workers are
+the only thing that cannot be archived: an ordinary thread always can, including one started
+in a terminal that the desktop app has never heard of, because the colony keeps its own list
+and writing the app's flag is best-effort on top of it.
+
+A worker also has a shorter vocabulary than a thread: working, or not. Only a thread you can
+be *in* can ask you a question, so waiting and blocked are not available to it — a `?` over a
+worker would send you somewhere with nothing to answer. That is enforced in `statusFor`, not
+just in the adapter, so no harness can hand the colony a worker that begs.
+
+They are also held to a stricter rule than a thread: a subagent is on the surface only while
+it is *running*. It cannot want a reply and there is nothing to go back to, so a finished one
+is a body standing on somebody else's site saying nothing — and a thread that fanned out ten
+times leaves ten of them. The yellow crew walks home as the work ends rather than lingering
+out the idle window. **All** still shows them, along with everything else.
+
+### What is left of your limits
+
+A small panel at the top right: how much of the **session** and **weekly** windows is spent,
+and when each resets. A per-model window shows as `Weekly · Opus`.
+
+Two caches on this machine can answer, and each window is filled from whichever of them saw it
+most recently. Claude Code keeps its own in `~/.claude.json`, refreshed whenever it happens to
+talk to the API — which can leave it hours out. [`ccstatusline`](https://www.npmjs.com/package/ccstatusline),
+if you run it, keeps one in `~/.cache/ccstatusline/usage.json` on a three-minute cache, but only
+refreshes it while something is actually drawing your status line.
+
+So the panel follows those files within seconds and cannot make either of them newer: expect a
+reading around three minutes old while you are prompting, and an older one while you are not.
+It is stamped with its source and its age, and goes amber past ten minutes, because a cache
+presented as live is a lie with a number on it. A window that has just rolled over reads
+`window not started` rather than vanishing.
+
+It reports **percentages, not tokens** — a percentage of the window is what the API tells these
+tools, and no token figure exists on disk to convert it from.
+
+Nothing is fetched. The colony has no account and no credentials; it reads answers other tools
+already wrote to disk, exactly like everything else here. A machine with neither cache shows
+nothing.
+
+### Who shows up
+
+A few hundred threads is a list, not a colony. Three settings, under **Who shows up** in the
+panel, decide who is on the surface and how it is laid out:
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Active / All | Active | **Active** is running, asking for you (a reply wanted, or an error), or touched inside the idle window. **All** is every thread you have not archived, dormant ones included |
+| Idle window | 30 minutes | How long a quiet thread still counts as active. Ignored while **All** is on |
+| Split a repo at | 12 threads | Past this many threads a repo becomes one zone per kind of work. *Never* turns splitting off |
+
+Anything running is in, and so is anything asking for you however long it has been sitting —
+an unread thread does not stop being unread because you left it overnight. Everything else is
+in while it is inside the idle window.
+
+The crew is ranked before it is drawn: running first, then blocked, then waiting, most
+recently touched within each. That ranking is deliberately *not* the sidebar's — a list should
+lead with whatever is shouting loudest, but the renderer's crew capacity cuts the roster from
+the end, and a cut that drops the one running thread in favour of older unread ones is the
+single outcome worth ruling out. On **All**, that capacity is what you actually see: raise
+**Crew capacity** under Performance if you want more of the pile at once.
+
+Nothing is deleted or archived by any of this. A thread left off the surface is still
+scanned, still in `~/.claude`, and walks back down the ramp the moment it earns a place.
+
+Archiving is the one thing that does hide a thread on purpose, and it undoes itself two ways:
+what you archived is listed under **Who shows up**, newest first, a click from coming back —
+and a thread you go back to un-archives itself, because archiving says *I am done with this*
+and returning to the session says the opposite.
 
 Zone names follow the same rule: a plot shows its name only while somebody there is working,
 waiting or stuck. Everything else is nameless until you point at it. The plate itself is just
