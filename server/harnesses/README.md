@@ -93,16 +93,19 @@ what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map
 | `gitBranch` | string | Branch name, or `''` |
 | `model` / `effort` | string | Shown on the thread card |
 | `createdAt` | number | Epoch ms |
-| `lastActivityAt` | number | Epoch ms. Sorts the colony and drives the "asleep for 3 days" behaviour |
+| `lastActivityAt` | number | Epoch ms. Sorts the colony and decides dormancy — see the idle window under **Who shows up** |
 | `lastFocusedAt` | number | Epoch ms, `0` if unknowable |
-| `running` | boolean | Working **right now** — the astronaut hammers away |
-| `unread` | boolean | Moved on since you last looked — the astronaut stops and holds a `?` |
+| `running` | boolean | Working **right now** — the astronaut hammers away. A live process is not enough: a session sitting at its prompt is not running, so check that the thread is mid-turn |
+| `unread` | boolean | Wants you — moved on since you last looked, or handed the turn back and is waiting on a reply. The astronaut stops and holds a `?` |
 | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
+| `subagent` | boolean | This thread is a worker its parent spawned. Drawn in a yellow suit, on the parent's zone, and never openable or archivable |
+| `parentId` | string | The thread that spawned it, when `subagent` is set. Give a subagent its **parent's** `project`/`projectPath`, not its own working directory's — a worker usually runs in a worktree or a scratch folder |
+| `parentRef` | object | Opaque ref for the *parent*, when `subagent` is set: opening a worker opens the thread that spawned it. Keep it apart from `ref`, and leave a worker's own `ref` empty — a worker is never archivable, and pointing `ref` at the parent would archive a live thread from a click on one of its workers |
 | `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
 | `archived` | boolean | Archived in the harness's own records |
 | `sizeBytes` | number | Transcript size. **This is how finished a building looks**, on a log scale |
 | `source` | string | Free-form, for your own bookkeeping (the Claude adapter uses `desktop` / `cli`) |
-| `canOpen` / `canArchive` | boolean | Whether this thread supports those actions. The UI greys the buttons out |
+| `canOpen` / `canArchive` | boolean | Whether this thread supports those actions. The UI greys the buttons out. Set `canArchive` for any real thread, including one your harness keeps no record of — archiving is recorded in the colony's own list, and the record write is best-effort on top of that |
 | `ref` | object | **Opaque.** Whatever *you* need to find this thread again |
 
 ### About `ref`

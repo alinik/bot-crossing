@@ -69,12 +69,38 @@ than have you work around it.
 
 | In the colony | In your threads |
 | --- | --- |
-| One hex zone | One repo. Bigger repos claim more tiles — one per seven threads, grown as a contiguous blob from the middle outward. A zone stays where it is: see below |
+| One hex zone | One repo — or, past a dozen threads, one *kind of work* in that repo: see below. Bigger zones claim more tiles, one per seven threads, grown as a contiguous blob from the middle outward. A zone stays where it is: see below |
 | One astronaut + one building | One session |
+| A **yellow** astronaut | A subagent that session spawned — see below |
+| Helmet colour | Which model is answering: Opus violet, Sonnet blue, Haiku green, Fable pink |
 | How finished a building looks | How large its transcript is, on a log scale |
 | Scaffolding | Somebody is at that site right now |
 | Walking out of the ship | A thread that just appeared |
 | Walking back into the ship | You archived it |
+
+### A crowded repo splits by what its threads are doing
+
+A zone is a repo, which works right up until the repo is a *workspace* — a folder you start
+sessions from that holds a dozen checkouts underneath it. Every one of those threads reports
+the same directory, so they all pile onto one enormous plot: reviews, ticket triage, incident
+digs and one-off scripts standing shoulder to shoulder with nothing to tell them apart.
+
+So past twelve threads a repo splits into one zone per kind of work — `front-main › reviews`,
+`PycharmProjects › incidents`, `PycharmProjects › /sentry-triage-resolve`. The kind is read
+off the thread's own title, since that is the only field carrying any intent: a thread
+launched from a skill names the skill (and is labelled with its slash, so `/fix` never reads
+as the `fixes` bucket next door), and everything else falls through an ordered set of keyword
+buckets — reviews, incidents, tickets, infra, fixes, reports, builds, and `misc` for whatever
+is left. First match wins, most specific first, exactly like the status precedence above:
+"Review and merge CF-2237" is a review before it is a ticket.
+
+The split is decided on the repo's *whole* size, not on each type's, so a zone does not
+dissolve back into its parent the moment one kind of work thins out. Under the threshold a
+repo stays a single zone, because there the repo is still the more useful answer.
+
+Where that threshold sits is **Split a repo at** under **Who shows up**, twelve threads by
+default; turned all the way down it reads *Never*, and every repo is one zone however many
+threads are standing on it. The rules themselves live in `src/game/task-types.js`.
 
 ### A zone stays where it is
 
@@ -423,7 +449,7 @@ its plot walks rather than hammering while it slides:
 | Waiting on you | `Waving` |
 | Errored | `Hit_A` |
 | PR merged | `Cheering` |
-| Nothing for three days | `Sit_Floor_Down` → `Sit_Floor_Idle`, and then it holds still |
+| Quiet past the idle window | — the astronaut is never spawned, so no clip plays |
 | Anything else | `Idle_A`, or `Walking_A` / `Running_A` while moving |
 
 The clip is chosen from the distance an astronaut **actually covered** last frame, not from

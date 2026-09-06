@@ -168,7 +168,15 @@ export class Hud {
       ),
       this._toggle('Adaptive quality', 'autoQuality', 'Quietly drops render scale if frames get expensive.'),
       this._slider('Scatter', 'scatterDensity', 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`),
-      this._slider('Max crew', 'maxAgents', 10, 200, 10, (v) => String(v)),
+      this._slider(
+        'Crew capacity',
+        'maxAgents',
+        10,
+        200,
+        10,
+        (v) => String(v),
+        'How many astronauts the renderer has room for. Who is out at all is “Who shows up”, below.'
+      ),
       this._toggle('Stars', 'stars')
     )
     body.appendChild(perf)
@@ -229,6 +237,55 @@ export class Hud {
       this._toggle('Show FPS', 'showFps')
     )
     body.appendChild(view)
+
+    // Who shows up. Not a quality setting — it decides what the colony is *about* — so it
+    // sits on its own rather than under a preset that would overwrite it.
+    const crowd = group('Who shows up')
+    crowd.append(
+      chips(
+        [
+          { id: 'active', label: 'Active', title: 'Running, asking for you, or touched inside the idle window' },
+          { id: 'all', label: 'All', title: 'Every thread you have not archived, dormant ones included' },
+        ],
+        () => this.settings.get('crewFilter'),
+        (id) => this.settings.set('crewFilter', id),
+        this.controls
+      ),
+      this._slider(
+        'Idle window',
+        'idleWindow',
+        5,
+        720,
+        5,
+        (v) => (v >= 60 ? `${(v / 60).toFixed(v % 60 ? 1 : 0)}h` : `${v}m`),
+        'How long a quiet thread still counts as active. Ignored while All is on.'
+      ),
+      this._slider(
+        'Split a repo at',
+        'splitAt',
+        0,
+        60,
+        1,
+        (v) => (v > 0 ? `${v} threads` : 'Never'),
+        'Past this many threads a repo becomes one zone per kind of work — reviews, tickets, incidents.'
+      )
+    )
+    // Filled by `setIgnored`, and empty — so invisible — until something is actually ignored.
+    this.ignoredRow = this._row('Ignored repos', 'Click one to put it back on the map.')
+    this.ignoredChips = document.createElement('div')
+    this.ignoredChips.className = 'chips'
+    this.ignoredRow.appendChild(this.ignoredChips)
+    this.ignoredRow.hidden = true
+    crowd.appendChild(this.ignoredRow)
+
+    // The way back from an archive. Same shape: hidden until there is something in it.
+    this.archivedRow = this._row('Archived threads', 'Click one to bring its astronaut back.')
+    this.archivedList = document.createElement('div')
+    this.archivedList.className = 'restore'
+    this.archivedRow.appendChild(this.archivedList)
+    this.archivedRow.hidden = true
+    crowd.appendChild(this.archivedRow)
+    body.appendChild(crowd)
   }
 
   _row(label, hint) {
@@ -375,8 +432,9 @@ export class Hud {
    * it is a list now because the sidebar is where all the chrome lives, and because a list
    * can carry a count and an alarm without running out of room at eleven repos.
    */
-  setLegend(projects, activeName = null) {
-    const signature = projects.map((p) => `${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') + `~${activeName}`
+  setLegend(projects, activeId = null) {
+    const signature =
+      projects.map((p) => `${p.id}:${p.name}:${p.count}:${p.accent}:${p.urgent ? 1 : 0}`).join('|') + `~${activeId}`
     if (this._last.legend === signature) return
     this._last.legend = signature
 
@@ -387,16 +445,16 @@ export class Hud {
       b.type = 'button'
       b.className = 'repo'
       b.title = `${p.count} thread${p.count === 1 ? '' : 's'} in ${p.name}`
-      b.setAttribute('aria-pressed', String(p.name === activeName))
+      b.setAttribute('aria-pressed', String(p.id === activeId))
       b.innerHTML =
         `<i class="swatch" style="background:${hex(p.accent)};color:${hex(p.accent)}"></i>` +
         `<span class="n">${escapeHtml(p.name)}</span>` +
         (p.urgent ? '<i class="alarm"></i>' : '') +
         `<span class="count">${p.count}</span>`
-      b.addEventListener('click', () => this.actions.pickProject?.(p.name))
+      b.addEventListener('click', () => this.actions.pickProject?.(p.id))
       wrap.appendChild(b)
     }
-    this.$('.sec-head span').textContent = `${projects.length} repo${projects.length === 1 ? '' : 's'}`
+    this.$('.sec-head span').textContent = `${projects.length} zone${projects.length === 1 ? '' : 's'}`
   }
 
   /**
@@ -419,7 +477,7 @@ export class Hud {
     // nothing is happening keeps whatever "4m ago" it was first drawn with, for as long as
     // you leave the panel open.
     const signature =
-      `${project.name}~${project.path}~${project.accent}~${project.selectedId}~${Math.floor(Date.now() / 60000)}~` +
+      `${project.id}~${project.name}~${project.path}~${project.accent}~${project.selectedId}~${Math.floor(Date.now() / 60000)}~` +
       project.threads.map((t) => `${t.id}:${t.status}:${t.title}:${t.lastActivityAt}`).join('|')
     panel.classList.add('drilled')
     if (this._last.project === signature) return
@@ -919,7 +977,12 @@ const TEMPLATE = `
       <div class="legend-row"><i class="badge" style="background:#3d1c1c;color:#e88b8b">!</i> the session hit an error</div>
       <div class="legend-row"><i class="badge" style="background:#16301f;color:#7fd39a">⚒</i> running right now, building</div>
       <div class="legend-row"><i class="badge" style="background:#332b12;color:#e6c67f">✓</i> its pull request landed</div>
-      <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> nothing for three days</div>
+      <div class="legend-row"><i class="badge" style="background:#1d1f2e;color:#a9a8c0">z</i> quiet past the idle window — left off the surface, see Who shows up</div>
+      <div class="legend-row" style="margin-top:10px">
+        <span style="opacity:.7">helmet colour is the model:</span>
+        ${MODEL_COLOURS.map(([name, tint]) => `<i class="swatch" style="background:${hex(tint)}"></i>${name}`).join('&nbsp; ')}
+      </div>
+      <div class="legend-row"><span style="opacity:.7">a yellow suit is a subagent — it works on its parent's zone</span></div>
     </div>
     <div style="margin-top:18px;display:flex;justify-content:flex-end">
       <button class="btn primary" id="btn-help-close">Got it</button>

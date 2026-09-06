@@ -114,14 +114,14 @@ const actions = {
     select(agent.id, { fly: true })
   },
 
-  focusProject: (name) => {
-    const plot = colony.plots.get(name)
+  focusProject: (id) => {
+    const plot = colony.plots.get(id)
     if (!plot) return
     rig.focus(plot.middle || plot.center, { distance: 30 })
   },
 
-  /** The legend, and anything else that means "show me this repo". */
-  pickProject: (name) => selectProject(name, { fly: true }),
+  /** The legend, and anything else that means "show me this zone". */
+  pickProject: (id) => selectProject(id, { fly: true }),
 
   /** Back out of one repo to the list of all of them. The panel itself never leaves. */
   closeProject: () => {
@@ -139,16 +139,19 @@ const actions = {
    * its workspace — nothing here is resumed, and nothing is written to disk.
    */
   newConversation: async () => {
-    const name = selectedProject
-    const folder = name && pathForProject(name)
+    const id = selectedProject
+    const folder = id && pathForProject(id)
     if (!folder) {
       hud.toast('No folder on disk for that project', 'err')
       return
     }
     try {
-      const harness = harnessForProject(name)
+      const harness = harnessForProject(id)
       await newSession(folder, harness)
-      hud.toast(`New thread in ${name} — opening ${harnessLabel(harness)}`)
+      // Named by the repo rather than the zone: a new thread starts in a folder, and which
+      // slice of that folder it ends up on is not decided until it has a title.
+      const repo = colony.plots.get(id)?.project || id
+      hud.toast(`New thread in ${repo} — opening ${harnessLabel(harness)}`)
       // It lands as an astronaut walking down the ramp, once it has a record to scan.
       setTimeout(poll, 6000)
     } catch (err) {
@@ -247,7 +250,8 @@ function select(id, { fly = false } = {}) {
   const thread = threads.find((t) => t.id === id) || agent.thread
   hud.setSelection(agent, thread)
   // Picking somebody is also picking the zone they are standing on: the sidebar follows.
-  if (thread?.project && colony.plots.has(thread.project)) selectedProject = thread.project
+  const zone = thread ? colony.zoneOf?.get(thread.id) : null
+  if (zone && colony.plots.has(zone)) selectedProject = zone
   syncProject()
   if (fly) {
     rig.focus(new THREE.Vector3(agent.pos.x, 0, agent.pos.z), { distance: Math.min(rig.desiredDistance, 26) })
@@ -255,13 +259,13 @@ function select(id, { fly = false } = {}) {
 }
 
 /** Open a zone's sidebar. Any selected astronaut from a different zone lets go. */
-function selectProject(name, { fly = false } = {}) {
-  if (!name || !colony.plots.has(name)) return
-  selectedProject = name
+function selectProject(id, { fly = false } = {}) {
+  if (!id || !colony.plots.has(id)) return
+  selectedProject = id
   const current = threads.find((t) => t.id === selectedId)
-  if (current && current.project !== name) select(null, {})
+  if (current && colony.zoneOf?.get(current.id) !== id) select(null, {})
   else syncProject()
-  if (fly) actions.focusProject(name)
+  if (fly) actions.focusProject(id)
 }
 
 /**
@@ -282,10 +286,10 @@ function harnessLabel(id) {
  * common answer among the threads standing there. A repo worked on from two harnesses gets
  * a new thread in whichever one it is mostly used from.
  */
-function harnessForProject(name) {
+function harnessForProject(id) {
   const counts = new Map()
   for (const thread of colony.threads.values()) {
-    if (thread.project !== name || !thread.harness) continue
+    if (colony.zoneOf?.get(thread.id) !== id || !thread.harness) continue
     counts.set(thread.harness, (counts.get(thread.harness) ?? 0) + 1)
   }
   let best = ''
@@ -298,10 +302,10 @@ function harnessForProject(name) {
   return best
 }
 
-function pathForProject(name) {
+function pathForProject(id) {
   const counts = new Map()
   for (const thread of colony.threads.values()) {
-    if (thread.project !== name) continue
+    if (colony.zoneOf?.get(thread.id) !== id) continue
     const dir = thread.projectPath || thread.cwd
     if (!dir) continue
     counts.set(dir, (counts.get(dir) ?? 0) + 1)
@@ -327,13 +331,13 @@ function syncProject() {
   }
   const now = Date.now()
   const list = [...colony.threads.values()]
-    .filter((thread) => thread.project === plot.name)
+    .filter((thread) => colony.zoneOf?.get(thread.id) === plot.id)
     .map((thread) => ({
       id: thread.id,
       title: thread.title,
       worktree: thread.worktree,
       lastActivityAt: thread.lastActivityAt,
-      status: statusFor(thread, now),
+      status: statusFor(thread, now, colony.staleMs),
     }))
     // Whoever wants something first, then most recently touched — the same order of
     // importance the badges use above their heads.
@@ -343,9 +347,11 @@ function syncProject() {
     })
 
   hud.setProject({
+    // The id addresses the zone; the name is only ever read.
+    id: plot.id,
     name: plot.name,
     accent: plot.accent,
-    path: pathForProject(plot.name),
+    path: pathForProject(plot.id),
     threads: list,
     selectedId,
   })
@@ -426,7 +432,7 @@ engine.canvas.addEventListener('pointerup', (e) => {
   // Nobody there: a zone's deck or its name plate opens that repo's sidebar instead, and
   // bare ground puts everything down.
   const plot = plotUnder(e, p)
-  if (plot) selectProject(plot.name, {})
+  if (plot) selectProject(plot.id, {})
   else {
     select(null, {})
     actions.closeProject()
@@ -656,7 +662,16 @@ settings.onChange((changed, scope) => {
   if (scope.render || changed.has('fov')) engine.applySettings()
   colony.onSettingsChanged(changed, scope)
   if (changed.has('showFps')) hud.syncSettings()
-  if (changed.has('maxAgents')) applyThreads(threads)
+  // Who shows up is a pure function of the thread list and these, so a change to any of them
+  // redraws the colony from the list already in hand rather than waiting for a poll.
+  if (
+    changed.has('maxAgents') ||
+    changed.has('idleWindow') ||
+    changed.has('crewFilter') ||
+    changed.has('splitAt')
+  ) {
+    applyThreads(threads)
+  }
 })
 
 // ── frame ─────────────────────────────────────────────────────────────────────────────
