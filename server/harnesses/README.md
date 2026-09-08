@@ -22,6 +22,7 @@ export default {
   newSession,                    // (dir) => { ok, url } | { ok: false, error }
   setArchived,                   // (ref, archived) => Promise<{ ok, error? }>
   appStartedAt,                  // optional: () => Promise<number>
+  usage,                         // optional: () => Promise<Usage | null>
 }
 ```
 
@@ -76,24 +77,7 @@ re-asserts the flag every scan, and uses this timestamp to tell "already picked 
 "still waiting on disk" — which is what drives the *pending* look on an astronaut walking to
 the ship. A CLI-only harness has no such app; omit the method.
 
-## The `Thread` your adapter returns
-
-Only `id` is truly required, but the colony gets duller the more you leave out — `project` is
-what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map.
-
-### Return one thread per conversation, not one per record
-
-If a harness writes more than one record for the same conversation — the Claude desktop app
-writes a fresh one every time you resume a thread — merge them before returning. Whatever key
-they share is the thread; a record with no title, no transcript and no live process behind it
-is bookkeeping, not a session, and the adapter drops it.
-
-Two things go wrong if you do not. An archived conversation comes back as a nameless twin,
-because archiving names the ids the *real* record carried and the empty one was never in that
-list. And the colony draws an astronaut with nothing to show for itself, which reads as a bug
-in the world rather than in the scan.
-
-### Optional: `usage()`
+### `usage()` — optional
 
 A harness that knows what the account has left of its limits can say so. Everything about it
 is optional — a harness without a `usage` shows nothing, rather than the colony inventing a
@@ -129,6 +113,23 @@ account does not have.
 An adapter may read more than one source. Merge them **per window**, taking each from the most
 recent source that reports it, and report the age of the oldest reading you used.
 
+## The `Thread` your adapter returns
+
+Only `id` is truly required, but the colony gets duller the more you leave out — `project` is
+what earns a repo its own zone, and `lastActivityAt` is what sorts the whole map.
+
+### Return one thread per conversation, not one per record
+
+If a harness writes more than one record for the same conversation — the Claude desktop app
+writes a fresh one every time you resume a thread — merge them before returning. Whatever key
+they share is the thread; a record with no title, no transcript and no live process behind it
+is bookkeeping, not a session, and the adapter drops it.
+
+Two things go wrong if you do not. An archived conversation comes back as a nameless twin,
+because archiving names the ids the *real* record carried and the empty one was never in that
+list. And the colony draws an astronaut with nothing to show for itself, which reads as a bug
+in the world rather than in the scan.
+
 | Field | Type | What it means |
 | --- | --- | --- |
 | `id` | string | **Unique across every harness.** A UUID is fine; otherwise prefix it, e.g. `my-harness:1234` |
@@ -149,7 +150,7 @@ recent source that reports it, and report the age of the oldest reading you used
 | `subagent` | boolean | This thread is a worker its parent spawned. Drawn in a yellow suit, on the parent's zone, and never openable or archivable |
 | `parentId` | string | The thread that spawned it, when `subagent` is set. Give a subagent its **parent's** `project`/`projectPath`, not its own working directory's — a worker usually runs in a worktree or a scratch folder |
 | `parentRef` | object | Opaque ref for the *parent*, when `subagent` is set: opening a worker opens the thread that spawned it. Keep it apart from `ref`, and leave a worker's own `ref` empty — a worker is never archivable, and pointing `ref` at the parent would archive a live thread from a click on one of its workers |
-| `starred` / `routine` / `prState` | | Optional extras; `prState: 'merged'` triggers the confetti |
+| `starred` / `routine` / `prState` | | Optional extras; `prState: 'MERGED'` triggers the confetti — `statusFor` compares it exactly |
 | `archived` | boolean | Archived in the harness's own records |
 | `sizeBytes` | number | Transcript size. **This is how finished a building looks**, on a log scale |
 | `source` | string | Free-form, for your own bookkeeping (the Claude adapter uses `desktop` / `cli`) |
@@ -176,6 +177,10 @@ Do not put a file handle, a class instance, or a secret in it.
   drops a trailing partial line, so `JSON.parse` never sees half a record.
 - **Expect malformed data.** A session being written *right now* is a normal thing to trip
   over. Skip that record and move on; do not throw the pass away.
+- **Read only what you need to.** `usage()` is the one method that may look outside the
+  harness's own session store — the Claude Code adapter reads two caches another tool on the
+  machine already wrote. Never fetch, and never touch credentials: if the answer is not already
+  on disk, the colony does without it.
 - **Never widen `id` collisions.** The colony keys its archive list and saved layout on `id`.
   Two harnesses handing back the same id would merge two unrelated threads into one astronaut.
 
@@ -224,3 +229,9 @@ a new one should clear too:
 4. `npm run dev`, then confirm the astronauts appear on the right plots, the thread card fills
    in, and Open does what you expect.
 5. Archive one thread and check it shows as archived **in the harness's own UI**, not just here.
+6. If you implemented `usage()`, `GET /api/usage` should report your harness with percentages
+   that match whatever the harness's own tooling says:
+
+   ```bash
+   curl -s localhost:5274/api/usage
+   ```
