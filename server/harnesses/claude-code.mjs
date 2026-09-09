@@ -6,19 +6,20 @@
  * means writing a sibling of this file rather than editing the scanner. The contract is
  * written down in `server/harnesses/README.md`.
  *
+ * Read-only, without exception. Nothing here writes to Claude Code's files — see the note on
+ * archiving in `server/harnesses/README.md`.
+ *
  * Two stores, deliberately merged rather than picked between:
  *   - the desktop app keeps one JSON record per thread (title, cwd, model, timestamps)
  *   - the CLI keeps the raw transcript, which is the only source for terminal-started work
  */
 import fsp from 'node:fs/promises'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-import { exists, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import { exists, findExecutable, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
 import { readLocalStorage } from './leveldb.mjs'
 
-const execFileAsync = promisify(execFile)
 const HOME = os.homedir()
 
 /**
@@ -28,12 +29,47 @@ const HOME = os.homedir()
 function desktopDataDir() {
   switch (process.platform) {
     case 'win32':
-      return path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Claude')
+      return windowsDataDir()
     case 'linux':
       return path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'Claude')
     default:
       return path.join(HOME, 'Library', 'Application Support', 'Claude')
   }
+}
+
+/**
+ * Windows has two answers, because the app ships two ways.
+ *
+ * The classic installer writes to `%APPDATA%\Claude`, which is what Electron's `userData` means
+ * everywhere else. Installed from the Microsoft Store the app is an MSIX package, and MSIX
+ * *redirects* what a packaged app believes is `%APPDATA%` into its own private
+ * `…\Packages\<family>\LocalCache\Roaming`. The app is installed, running and writing session
+ * records — and `%APPDATA%\Claude` does not exist at all.
+ *
+ * The package folder is globbed rather than named: its suffix is a hash of the publisher, and
+ * hard-coding that buys a constant which is right until it is not, and then wrong in a way that
+ * looks exactly like the app having been uninstalled.
+ *
+ * Resolved once, at import. Installing the app while the colony is running therefore wants a
+ * restart to be noticed — a knowing trade, since the alternative is globbing `Packages` on every
+ * scan to catch something that happens once.
+ */
+function windowsDataDir() {
+  const roaming = path.join(process.env.APPDATA || path.join(HOME, 'AppData', 'Roaming'), 'Claude')
+  const local = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local')
+  const candidates = [roaming]
+  try {
+    for (const entry of readdirSync(path.join(local, 'Packages'), { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith('Claude_')) {
+        candidates.push(path.join(local, 'Packages', entry.name, 'LocalCache', 'Roaming', 'Claude'))
+      }
+    }
+  } catch {
+    /* no Packages directory — this machine has no Store apps at all */
+  }
+  // Whichever actually holds the records. Falling back to the unpackaged path keeps every
+  // caller working against a real path when neither exists, which `detect()` reads as "no app".
+  return candidates.find((dir) => existsSync(path.join(dir, 'claude-code-sessions'))) || roaming
 }
 
 /** Where the Claude desktop app keeps one JSON record per thread. */
@@ -61,8 +97,19 @@ const HEAD_BYTES = 192 * 1024
  */
 const ACTIVE_WINDOW_MS = 30 * 60 * 1000
 
+/**
+ * Every id this adapter hands out is prefixed. `server/harnesses/README.md` asks for ids unique
+ * across harnesses, and while two UUIDs will not collide, the colony keys its archive list and
+ * saved layout on this string — so it is worth being unambiguous rather than merely lucky.
+ */
+const ID = (raw) => `claude-code:${raw}`
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const DESKTOP_ID = /^local_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+// The type check matters wherever an id came back from the page: `RegExp.test` stringifies, so a
+// one-element array holding a valid id would pass the pattern and then travel on as an array.
+const isCliId = (v) => typeof v === 'string' && UUID.test(v)
+const isDesktopId = (v) => typeof v === 'string' && DESKTOP_ID.test(v)
 
 function firstText(content) {
   if (typeof content === 'string') return content
@@ -338,20 +385,24 @@ function toThread(t) {
     parentCliId,
     ...rest
   } = t
-  const openable = (desktop, cli) => Boolean((desktop && DESKTOP_ID.test(desktop)) || (cli && UUID.test(cli)))
+  const openable = (desktop, cli) => isDesktopId(desktop) || isCliId(cli)
   return {
     ...rest,
-    // A subagent opens its parent — there is no session of its own to resume — and cannot be
-    // archived at all: it has no record to flag, and it is not yours to retire. The thread
-    // that spawned it owns its lifetime, and archiving that takes its workers with it.
+    // A subagent opens its parent — there is no session of its own to resume. The thread that
+    // spawned it owns its lifetime.
     canOpen: t.subagent ? openable(parentDesktopId, parentCliId) : openable(desktopSessionId, cliSessionId),
-    // Every real thread can be retired, including one the desktop app has never heard of:
-    // a terminal-only session has no record to flag, so archiving it is recorded in the
-    // colony alone — which is the whole reason the colony keeps a list of its own.
-    canArchive: !t.subagent,
-    ref: { desktopSessionId, desktopSessionIds, cliSessionId },
+    // The cwd rides along because resuming from a terminal has to happen in the folder the
+    // session ran in — the worktree, not the repo root.
+    ref: { desktopSessionId, desktopSessionIds, cliSessionId, cwd: t.cwd || '' },
     ...(t.subagent
-      ? { parentRef: { desktopSessionId: parentDesktopId || '', desktopSessionIds: [], cliSessionId: parentCliId || '' } }
+      ? {
+          parentRef: {
+            desktopSessionId: parentDesktopId || '',
+            desktopSessionIds: [],
+            cliSessionId: parentCliId || '',
+            cwd: t.cwd || '',
+          },
+        }
       : {}),
   }
 }
@@ -441,7 +492,7 @@ async function scanThreads() {
     const meta = entry ? await transcriptMeta(entry) : null
 
     add({
-      id: cliSessionId || s.sessionId,
+      id: ID(cliSessionId || s.sessionId),
       cliSessionId,
       desktopSessionId: s.sessionId || '',
       desktopSessionIds: s.sessionId ? [s.sessionId] : [],
@@ -492,7 +543,7 @@ async function scanThreads() {
     const cwd = meta.cwd || decodeProjectDir(path.basename(entry.projectDir))
     const { projectPath, project, worktree } = projectOf(cwd, '')
     add({
-      id,
+      id: ID(id),
       cliSessionId: id,
       desktopSessionId: '',
       desktopSessionIds: [],
@@ -518,7 +569,7 @@ async function scanThreads() {
       archived: false,
       hasTranscript: true,
       sizeBytes: entry.size,
-      transcriptFile: entry.file,
+      transcriptFile: entry?.file || '',
       source: 'cli',
     })
   }
@@ -669,56 +720,18 @@ async function scanThreads() {
   return threads.map(toThread)
 }
 
-/** Locate the desktop app's record for a session. Id is pattern-checked, never joined raw. */
-async function findSessionFile(sessionId) {
-  if (!DESKTOP_ID.test(sessionId)) return null
-  for (const account of await listDirs(DESKTOP_SESSIONS)) {
-    for (const org of await listDirs(account)) {
-      const file = path.join(org, `${sessionId}.json`)
-      if (await exists(file)) return file
-    }
-  }
-  return null
-}
-
 /**
- * Flip `isArchived` on the desktop app's own session record — the same field its
- * Archived list reads. Only that one key is touched; everything else is written back
- * byte-for-byte from what was there, through a temp file so a crash can't truncate it.
+ * Where the `claude` CLI is, for a machine that has it but no desktop app to answer the deep
+ * link. PATH first, then the places its installers put it — never inside an application bundle.
+ * Only Linux asks: on macOS and Windows the deep link is always answered, so the walk is wasted.
  */
-async function setSessionArchived(sessionId, archived) {
-  const file = await findSessionFile(sessionId)
-  if (!file) return { ok: false, error: 'No Claude Code session record for that thread' }
-
-  let record
-  try {
-    record = JSON.parse(await fsp.readFile(file, 'utf8'))
-  } catch {
-    return { ok: false, error: 'Session record is unreadable' }
-  }
-  if (!record || typeof record !== 'object' || record.sessionId !== sessionId) {
-    return { ok: false, error: 'Session record did not look like the expected session' }
-  }
-
-  record.isArchived = Boolean(archived)
-  const tmp = `${file}.botcrossing.tmp`
-  await fsp.writeFile(tmp, JSON.stringify(record, null, 2))
-  await fsp.rename(tmp, file)
-  metaCache.delete(record.cliSessionId)
-  return { ok: true, file, archived: Boolean(archived) }
-}
-
-/** Archive every record that maps to a thread — the real one and any import ghosts. */
-async function setArchived(ref, archived) {
-  const ids = ref?.desktopSessionIds || []
-  if (!ids.length) return { ok: false, error: 'No session records for that thread' }
-  const results = []
-  for (const id of ids) results.push(await setSessionArchived(id, archived))
-  const ok = results.some((r) => r.ok)
-  return ok
-    ? { ok, archived: Boolean(archived), records: results.filter((r) => r.ok).length }
-    : results[0] || { ok: false, error: 'No session records for that thread' }
-}
+const CLI_DIRS = [
+  path.join(HOME, '.local', 'bin'),
+  path.join(HOME, '.claude', 'local'),
+  '/usr/local/bin',
+  '/usr/bin',
+]
+const cliBinary = () => findExecutable('claude', CLI_DIRS)
 
 /**
  * Hands the thread back to Claude Code. `epitaxy/<local_…>` *navigates* the desktop app
@@ -726,15 +739,20 @@ async function setArchived(ref, archived) {
  * untitled session and rewrites the .jsonl — so it is only ever the fallback for threads
  * the app has never seen. Ids are pattern-checked before they reach the opener.
  */
-function openThread(ref) {
-  const { desktopSessionId, cliSessionId } = ref || {}
-  if (desktopSessionId && DESKTOP_ID.test(desktopSessionId)) {
-    return { ok: true, url: `claude://claude.ai/epitaxy/${desktopSessionId}` }
+async function openThread(ref) {
+  const { desktopSessionId, cliSessionId, cwd } = ref || {}
+  let url = ''
+  if (isDesktopId(desktopSessionId)) url = `claude://claude.ai/epitaxy/${desktopSessionId}`
+  else if (isCliId(cliSessionId)) url = `claude://resume?session=${cliSessionId}`
+
+  let command
+  if (process.platform === 'linux' && isCliId(cliSessionId)) {
+    const bin = await cliBinary()
+    if (bin) command = { argv: [bin, '--resume', cliSessionId], cwd: typeof cwd === 'string' ? cwd : '' }
   }
-  if (cliSessionId && UUID.test(cliSessionId)) {
-    return { ok: true, url: `claude://resume?session=${cliSessionId}` }
-  }
-  return { ok: false, error: 'No openable session id on that thread' }
+
+  if (!url && !command) return { ok: false, error: 'No openable session id on that thread' }
+  return { ok: true, url, command }
 }
 
 /**
@@ -742,73 +760,14 @@ function openThread(ref) {
  * "New Claude Code Session Here" quick action uses. Nothing is resumed and nothing is
  * written: the desktop app just opens an empty session with that folder as its workspace.
  */
-function newSession(dir) {
-  return { ok: true, url: `claude://code/new?${new URLSearchParams({ folder: dir })}` }
-}
-
-/**
- * When the Claude desktop app last launched. It loads every session record into memory at
- * startup and never re-reads them, so this timestamp is the line between an archive it has
- * seen and one still waiting on disk.
- */
-let appStartCache = { at: 0, checkedAt: 0 }
-async function appStartedAt() {
-  const now = Date.now()
-  if (now - appStartCache.checkedAt < 15000) return appStartCache.at
-
-  let started = 0
-  try {
-    started = process.platform === 'win32' ? await windowsAppStartedAt() : await darwinAppStartedAt()
-  } catch {
-    /* no process listing — treat the app as never having restarted */
+async function newSession(dir) {
+  const url = `claude://code/new?${new URLSearchParams({ folder: dir })}`
+  let command
+  if (process.platform === 'linux') {
+    const bin = await cliBinary()
+    if (bin) command = { argv: [bin], cwd: dir }
   }
-  appStartCache = { at: started, checkedAt: now }
-  return started
-}
-
-async function darwinAppStartedAt() {
-  const { stdout } = await execFileAsync('ps', ['-axo', 'pid=,lstart=,command='], { maxBuffer: 8 * 1024 * 1024 })
-  for (const line of stdout.split('\n')) {
-    const m = line.match(/^\s*\d+\s+(\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \d{4})\s+(\/.*)$/)
-    if (!m) continue
-    const [, when, command] = m
-    // The main process only — helper processes carry a --type= flag.
-    if (!command.includes('/Claude.app/Contents/MacOS/Claude') || command.includes('--type=')) continue
-    const parsed = Date.parse(when)
-    return Number.isNaN(parsed) ? 0 : parsed
-  }
-  return 0
-}
-
-/**
- * The same answer on Windows. There is no `ps`, and `tasklist` knows neither start times nor
- * command lines, so this asks CIM, which knows both. The desktop app and the CLI are both
- * `claude.exe` here, so the main process is picked out by shape rather than by path: the one
- * with no `--type=` flag whose children (the helpers, which all carry one) point back at it.
- * A PowerShell round trip is a few hundred milliseconds, which the 15s cache above absorbs.
- */
-async function windowsAppStartedAt() {
-  const script = [
-    "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | ForEach-Object {",
-    "  if ($_.CreationDate) { '{0}|{1}|{2}|{3}' -f $_.ProcessId, $_.ParentProcessId,",
-    "    $_.CreationDate.ToUniversalTime().ToString('o'), $_.CommandLine } }",
-  ].join(' ')
-  const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
-    maxBuffer: 8 * 1024 * 1024,
-  })
-  const rows = stdout
-    .split(/\r?\n/)
-    .map((line) => line.split('|'))
-    .filter((parts) => parts.length >= 4)
-    .map(([pid, ppid, when, ...command]) => ({
-      pid,
-      ppid,
-      when: Date.parse(when),
-      command: command.join('|'),
-    }))
-  const helperParents = new Set(rows.filter((r) => r.command.includes('--type=')).map((r) => r.ppid))
-  const main = rows.find((r) => helperParents.has(r.pid) && !r.command.includes('--type='))
-  return main && !Number.isNaN(main.when) ? main.when : 0
+  return { ok: true, url, command }
 }
 
 /** Where the CLI caches what the account has spent of its limits. */
@@ -981,8 +940,6 @@ export default {
   scanThreads,
   openThread,
   newSession,
-  setArchived,
-  appStartedAt,
   usage,
   paths: { DESKTOP_SESSIONS, CLI_PROJECTS, CLI_LIVE },
 }

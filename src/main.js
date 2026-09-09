@@ -15,10 +15,10 @@ import {
   fetchState,
   saveState,
   openThread,
-  archiveThread,
   newSession,
   revealFolder,
 } from './game/api.js'
+import { hideProject, hiddenCatalog, unhideProject } from './game/hidden-projects.js'
 
 /**
  * Boot and the outer game loop.
@@ -48,7 +48,7 @@ const engine = new Engine(settings).mount(app)
 const rig = new CameraRig(engine.camera, engine.canvas, settings)
 const colony = new Colony(engine.scene, settings, engine.camera, engine.renderer)
 
-let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, ignored: [] }
+let state = { archived: [], archivedAt: {}, opened: [], plots: {}, seen: {}, hiddenProjects: [], viewedAt: {} }
 let threads = []
 /** Last legend built for the bottom bar, kept so the open zone's chip can light up between polls. */
 let legendProjects = []
@@ -95,6 +95,7 @@ const actions = {
 
   cycleTime: () => {
     settings.set('autoTime', false)
+    settings.set('clockTime', false)
     const current = settings.get('timeOfDay')
     // Step to the next named time *after* the current one, wrapping at midnight.
     const next = TIMES.find((t) => t.value > current + 0.005) || TIMES[0]
@@ -170,6 +171,47 @@ const actions = {
     }
   },
 
+  /**
+   * Stop a thread asking for you, without touching it.
+   *
+   * `unread` comes from the harness, and the harness only counts a thread as read when it is
+   * focused *in its own app*. Answer one in a terminal, or read it over somebody's shoulder,
+   * and it keeps its hand up forever. Marking it viewed here records when you looked; the
+   * moment the thread does something newer than that it goes back to waving, which is the
+   * behaviour you actually want and the reason this is a timestamp rather than a flag.
+   */
+  markViewed: () => {
+    const thread = threads.find((t) => t.id === selectedId)
+    if (!thread) return
+    state.viewedAt = { ...(state.viewedAt || {}), [thread.id]: Date.now() }
+    queueSave()
+    applyThreads(threads)
+    hud.toast(`Marked ${thread.title.slice(0, 40)} as viewed`)
+  },
+
+  hideProject: () => {
+    const name = selectedProject
+    if (!name) return
+    state.hiddenProjects = hideProject(state.hiddenProjects || [], name)
+    queueSave()
+    // If the open thread belonged to the repo that just left, nothing is selected any more.
+    if (selectedId) {
+      const thread = threads.find((t) => t.id === selectedId)
+      if (thread?.project === name) select(null, {})
+    }
+    selectedProject = null
+    applyThreads(threads)
+    hud.toast(`Hidden ${name} — still in your harness, gone from the colony`)
+  },
+
+  unhideProject: (name) => {
+    if (!name) return
+    state.hiddenProjects = unhideProject(state.hiddenProjects || [], name)
+    queueSave()
+    applyThreads(threads)
+    hud.toast(`Showing ${name} again`)
+  },
+
   copyProjectPath: async () => {
     const folder = selectedProject && pathForProject(selectedProject)
     if (!folder) return
@@ -199,79 +241,49 @@ const actions = {
   },
 
   /**
-   * Drop a repo off the map for good — a scratch folder, a bot's own workspace, anything
-   * whose threads are noise rather than work. Archiving each thread would not do: the next
-   * one that repo produces would put the zone straight back.
+   * Un-archive a thread. The one gesture that was missing: an `A` pressed by accident took a
+   * live thread off the map with nothing anywhere to undo it. The colony's own list is the
+   * only thing archiving ever wrote, so taking the id back out of it is the whole undo.
    */
-  ignoreProject: () => {
-    const plot = selectedProject ? colony.plots.get(selectedProject) : null
-    const repo = plot?.project
-    if (!repo) return
-    state.ignored = [...new Set([...(state.ignored || []), repo])]
-    queueSave()
-    select(null, {})
-    actions.closeProject()
-    applyThreads(threads)
-    hud.toast(`${repo} is off the map — bring it back under Who shows up`)
-  },
-
-  /**
-   * Un-archive a thread. The one gesture that was missing: archiving wrote to the colony's
-   * list *and* to the harness's own record, and nothing anywhere could undo either — an `A`
-   * pressed by accident took a live thread off the map for good.
-   */
-  restoreThread: async (id) => {
+  restoreThread: (id) => {
     const thread = threads.find((t) => t.id === id)
     state.archived = state.archived.filter((x) => x !== id)
     const { [id]: _dropped, ...rest } = state.archivedAt || {}
     state.archivedAt = rest
     queueSave()
-    // The harness's own flag is best-effort, exactly as it is when archiving: the colony's
-    // list is the authority, and a thread the app has no record for is fine either way.
-    if (thread) {
-      try {
-        await archiveThread(thread, false)
-      } catch {
-        /* the colony has already let it go; the app's flag catches up or does not */
-      }
-    }
     applyThreads(threads)
     hud.toast(thread ? `${shortTitle(thread)} is back` : 'Restored')
     poll()
   },
 
-  /** Put an ignored repo back. Its zone returns to the ground it was on. */
-  restoreProject: (repo) => {
-    state.ignored = (state.ignored || []).filter((n) => n !== repo)
-    queueSave()
-    applyThreads(threads)
-    hud.toast(`${repo} is back`)
-  },
-
-  archiveThread: async () => {
+  // Archiving is the colony's own bookkeeping and nothing else: the thread leaves the map and
+  // the astronaut walks back to the ship. The harness's own records are never touched — see
+  // `reconcileArchived` in server/api.mjs for why that stopped being worth doing.
+  archiveThread: () => {
     const thread = threads.find((t) => t.id === selectedId)
     if (!thread) return
     // Also reachable from the keyboard, so the rule lives here rather than only on the button.
-    if (thread.canArchive === false) {
-      hud.toast(thread.subagent ? 'A worker is retired by its parent, not on its own' : 'Nothing to archive there')
+    if (thread.subagent) {
+      hud.toast('A worker is retired by its parent, not on its own')
       return
     }
-    try {
-      const res = await archiveThread(thread, true)
-      state.archived = [...new Set([...state.archived, thread.id])]
-      state.archivedAt = { ...state.archivedAt, [thread.id]: Date.now() }
-      queueSave()
-      select(null, {})
-      applyThreads(threads)
-      hud.toast(
-        res.harnessRecord === false
-          ? `Archived here (no ${thread.harnessName || 'harness'} record for it)`
-          : 'Archived — heading home'
-      )
-      colony.ship.ping()
-    } catch (err) {
-      hud.toast(err.message || 'Could not archive that thread', 'err')
-    }
+    const foldedBefore = new Set((colony.dormantZones || []).map((z) => z.name))
+    state.archived = [...new Set([...state.archived, thread.id])]
+    state.archivedAt = { ...state.archivedAt, [thread.id]: Date.now() }
+    queueSave()
+    select(null, {})
+    applyThreads(threads)
+    // Retiring the last thread anybody has touched in a repo makes every thread left in it
+    // dormant, and the whole zone folds away — sixty astronauts can leave the map on one
+    // click. That is the setting working, but silently it reads as the colony breaking, so
+    // it says which repo went and why.
+    const folded = (colony.dormantZones || []).map((z) => z.name).filter((n) => !foldedBefore.has(n))
+    hud.toast(
+      folded.length
+        ? `Archived — ${folded.join(', ')} ${folded.length === 1 ? 'is' : 'are'} all quiet now, folded off the map`
+        : 'Archived — heading home'
+    )
+    colony.ship.ping()
   },
 
   uiVisibility: (visible) => colony.setUiVisible(visible),
@@ -378,11 +390,15 @@ function pathForProject(id) {
 
 /** Push the open zone's current contents at the sidebar. Closes it if the zone is gone. */
 function syncProject() {
+  const hidden = hiddenCatalog(state.hiddenProjects || [], threads)
+  // Folded-away repos are listed alongside the ones you hid by hand. Same principle: nothing
+  // leaves the map without somewhere on screen saying where it went.
+  const folded = colony.dormantZones || []
   const plot = selectedProject ? colony.plots.get(selectedProject) : null
   if (!plot) {
     selectedProject = null
     hud.setProject(null)
-    hud.setLegend(legendProjects, null)
+    hud.setLegend(legendProjects, null, hidden, folded)
     return
   }
   const now = Date.now()
@@ -413,7 +429,7 @@ function syncProject() {
   })
   // The legend is the same selection seen from the bottom of the screen: keep it in step
   // here rather than only on the next poll.
-  hud.setLegend(legendProjects, selectedProject)
+  hud.setLegend(legendProjects, selectedProject, hidden, folded)
 }
 
 // ── pointer ───────────────────────────────────────────────────────────────────────────
@@ -557,6 +573,10 @@ window.addEventListener('keydown', (e) => {
     case 'A':
       if (selectedId) actions.archiveThread()
       break
+    case 'v':
+    case 'V':
+      if (selectedId) actions.markViewed()
+      break
     case 'c':
     case 'C':
       if (selectedProject) actions.newConversation()
@@ -610,8 +630,6 @@ function shortTitle(thread) {
 }
 
 function applyThreads(list) {
-  threads = list
-
   /**
    * Anything worked on since you archived it comes off the list — the scanner spots that and
    * says so, and the page is the one writer of the file, so the forgetting happens here.
@@ -629,14 +647,31 @@ function applyThreads(list) {
     )
   }
 
+  // A thread you have said you looked at stops counting as unread until it moves on again.
+  // Done here rather than in `statusFor` so the card, the badge and the astronaut all agree.
+  const viewed = state.viewedAt || {}
+  threads = list.map((t) => {
+    const at = viewed[t.id]
+    return at && t.lastActivityAt <= at ? { ...t, unread: false } : t
+  })
+  list = threads
   const archivedSet = new Set(state.archived)
-  // Ignored repos never reach the colony at all: not a zone, not a count, not a thread in
-  // the sidebar. They are still scanned, so un-ignoring one brings its threads straight back.
-  const ignored = new Set(state.ignored || [])
-  const stats = colony.setThreads(
-    ignored.size ? list.filter((t) => !ignored.has(t.project)) : list,
-    archivedSet
-  )
+  const hiddenSet = new Set(state.hiddenProjects || [])
+
+  // Which threads the colony has met before. Walking out of the ship is meant to *mean*
+  // something — a thread that just appeared — and without this every reload staged a
+  // hundred-astronaut entrance, which piled up at the ramp and read as a bug because it was
+  // one. A thread already on the books is simply already outside.
+  const known = new Set(Object.keys(state.seen || {}))
+  let firstSeen = false
+  for (const t of list) {
+    if (state.seen?.[t.id]) continue
+    state.seen = { ...(state.seen || {}), [t.id]: Date.now() }
+    firstSeen = true
+  }
+  if (firstSeen) queueSave()
+
+  const stats = colony.setThreads(list, archivedSet, hiddenSet, known)
   hud.setStats(stats)
 
   legendProjects = colony.plotOrder
@@ -658,7 +693,6 @@ function applyThreads(list) {
     if (still) hud.setSelection(still, list.find((t) => t.id === selectedId) || still.thread)
     else select(null, {})
   }
-  hud.setIgnored(state.ignored || [])
   // What you archived, newest first — the only route back onto the map.
   const archivedList = list
     .filter((t) => archivedSet.has(t.id))
@@ -714,7 +748,10 @@ function queueSave() {
   clearTimeout(pendingSave)
   pendingSave = setTimeout(async () => {
     try {
-      await saveState(state)
+      // Adopt whatever comes back: unchanged when the save was clean, and the merged colony when
+      // another tab had written since this one loaded. Dropping it would leave this page
+      // asserting a picture the file has already moved past, and the next save would fight.
+      state = await saveState(state)
     } catch {
       /* the colony still runs; only the archive list is at risk, and it retries next time */
     }
@@ -783,7 +820,8 @@ settings.onChange((changed, scope) => {
     changed.has('maxAgents') ||
     changed.has('idleWindow') ||
     changed.has('crewFilter') ||
-    changed.has('splitAt')
+    changed.has('splitAt') ||
+    changed.has('hideDormant')
   ) {
     applyThreads(threads)
   }

@@ -16,9 +16,11 @@ import { createBuilding, buildingUniforms, Scaffolds } from '../world/buildings.
 import { Ship } from '../world/ship.js'
 import { Astronauts } from '../agents/astronauts.js'
 import { Indicators, BADGE } from '../agents/indicators.js'
+import { MAX_AGENT_CAP } from '../core/settings.js'
 import { Particles } from '../agents/particles.js'
 import { Navigation } from '../agents/navigation.js'
 import { zonesFor } from './task-types.js'
+import { liveThreadsForColony } from './hidden-projects.js'
 
 /**
  * The colony: everything that turns a list of agent threads into a place.
@@ -194,6 +196,8 @@ export class Colony {
      * when a new one starts. Seeded from the colony file by `restoreLayout`.
      */
     this.plotCells = new Map()
+    this.dormantProjects = new Set()
+    this.dormantZones = []
     this.buildings = new Map()
     this.threads = new Map()
     this.usedAccents = new Set()
@@ -205,7 +209,11 @@ export class Colony {
     this.ship = new Ship(scene, shipPosition())
     this.astronauts = new Astronauts(scene, settings)
     this.astronauts.world = this._world()
-    this.indicators = new Indicators(scene, settings, Math.max(64, settings.get('maxAgents')))
+    // Sized for the largest preset rather than the current one: unlike the astronaut meshes these
+    // buffers are never rebuilt, so allocating against today's `maxAgents` means raising quality
+    // later silently starves the badges — the one `?` that wants you being the thing that goes
+    // missing. A badge is a single quad; the spare instances cost almost nothing.
+    this.indicators = new Indicators(scene, settings, MAX_AGENT_CAP)
     this.particles = new Particles(scene, settings)
     this.scaffolds = new Scaffolds(scene, 320)
     this.nav = new Navigation()
@@ -327,16 +335,17 @@ export class Colony {
    * ids — repo name for plots, session id for buildings — so a poll that changes nothing
    * moves nothing on screen.
    */
-  setThreads(threads, archivedIds = new Set()) {
+  setThreads(threads, archivedIds = new Set(), hiddenProjects = new Set(), knownIds = new Set()) {
     const now = Date.now()
     // Who is on the surface at all — see `selectVisible`. Both knobs are settings rather than
     // constants because how much of your own thread list you want standing in front of you is
-    // a taste, not a fact.
+    // a taste, not a fact. Archived, and repos taken off the map, are cut first.
     this.staleMs = Math.max(1, this.settings.get('idleWindow')) * 60 * 1000
-    const ranked = selectVisible(
-      threads.filter((t) => !t.archived && !archivedIds.has(t.id)),
-      { now, windowMs: this.staleMs, showAll: this.settings.get('crewFilter') === 'all' }
-    )
+    const ranked = selectVisible(liveThreadsForColony(threads, archivedIds, hiddenProjects), {
+      now,
+      windowMs: this.staleMs,
+      showAll: this.settings.get('crewFilter') === 'all',
+    })
     // The renderer's crew capacity is the last cut, and it has to be taken *here* rather than
     // left to `setRoster`: past it there is no astronaut, so a building, a zone and a line in
     // the counts would all be claiming somebody who is not on the surface. `selectVisible`
@@ -353,8 +362,51 @@ export class Colony {
     for (const zone of zones.values()) {
       for (const thread of zone.threads) this.zoneOf.set(thread.id, zone.key)
     }
+    /**
+     * Zones where nothing has stirred in days, folded away on request.
+     *
+     * A colony is a map you learn, and a map is only learnable if what is on it is worth
+     * looking at. Someone with a hundred checkouts has most of the ground given over to work
+     * they finished in the spring, and the six repos they are actually living in are somewhere
+     * in among it. Dormant is already a status the colony understands — nothing for three days
+     * — so this is that same line drawn one level up, at the zone rather than the thread.
+     *
+     * Deliberately all-or-nothing per zone: a zone with one live thread in it stays whole,
+     * because half a zone would misrepresent the repo rather than tidy the map.
+     */
+    const dormant = new Set()
+    const folded = []
+    if (this.settings.get('hideDormant')) {
+      for (const [key, zone] of zones) {
+        if (zone.threads.every((t) => statusFor(t, now, this.staleMs) === 'sleeping')) dormant.add(key)
+      }
+      // Never fold away everything: a colony that answers a poll with an empty planet reads as
+      // broken rather than tidy, and there is nothing on screen to tell you which it was.
+      if (dormant.size === zones.size) dormant.clear()
+      for (const key of dormant) {
+        const zone = zones.get(key)
+        // What the sidebar says went, and how much of it. The keys are zone keys — `group:…`,
+        // `repo›fixes` — so the plaque label is the only half worth showing a person.
+        folded.push({ name: zone.label, count: zone.threads.length })
+        for (const thread of zone.threads) this.zoneOf.delete(thread.id)
+        zones.delete(key)
+      }
+    }
+    this.dormantProjects = dormant
+    this.dormantZones = folded
 
     this._syncPlots(zones)
+
+    // A repo that is off the map keeps its footprint in layout memory, so showing it again
+    // reclaims the same ground if it is still free. Re-inserting the entry also keeps
+    // LAYOUT_MEMORY from evicting a name you only hid — otherwise a zone folded away for a
+    // week loses where it used to be, and comes back somewhere else entirely.
+    for (const name of [...hiddenProjects, ...dormant]) {
+      const cells = this.plotCells.get(name)
+      if (!cells) continue
+      this.plotCells.delete(name)
+      this.plotCells.set(name, cells)
+    }
 
     const roster = []
     const seenBuildings = new Set()
@@ -395,6 +447,8 @@ export class Colony {
           // Where the work actually is. A working astronaut circles it rather than standing
           // at one spot, so it needs the building, not just a place to stand near it.
           anchor: building.mesh.position.clone(),
+          // Already on the colony's books, so it does not need an entrance.
+          known: knownIds.has(thread.id),
         })
       })
     }

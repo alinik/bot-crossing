@@ -3,27 +3,50 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { openInTerminal, schemeHasHandler, schemeOf } from './lib/xdg.mjs'
 import {
   defaultHarness,
-  harnessAppStartedAt,
   harnessStatus,
   newSession as harnessNewSession,
   openThread as harnessOpenThread,
   harnessUsage,
   scanThreads,
-  setThreadArchived,
 } from './scan.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR = process.env.BOT_CROSSING_DATA || path.join(here, '..', 'data')
 const STATE_FILE = path.join(DATA_DIR, 'colony.json')
 
-const STATE_VERSION = 1
+const STATE_VERSION = 2
+
+/**
+ * v1 keyed everything on a bare session id, because Claude Code was the only harness and its
+ * ids are UUIDs. Adapters now prefix (`claude-code:…`, `codex:…`) so two harnesses can never
+ * name the same thread, which means a v1 file's archive list no longer matches anything.
+ *
+ * Only Claude Code ever wrote a bare id, so the rewrite is unambiguous. One shot, on read.
+ */
+const BARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const migrateId = (id) => (BARE_UUID.test(id) ? `claude-code:${id}` : id)
+
+function migrate(raw) {
+  if (Number(raw.version) >= 2) return raw
+  const keys = (o) => Object.fromEntries(Object.entries(asObject(o)).map(([k, v]) => [migrateId(k), v]))
+  return {
+    ...raw,
+    archived: asArray(raw.archived).map(migrateId),
+    archivedAt: keys(raw.archivedAt),
+    opened: asArray(raw.opened).map(migrateId),
+    seen: keys(raw.seen),
+    viewedAt: keys(raw.viewedAt),
+  }
+}
 
 /**
  * Colony state is only ever the things the *game* invents — which plot a project got,
- * what a thread's building looks like, what you archived. The threads themselves stay
- * read-only: nothing here ever writes to a harness's data except the one archive flag.
+ * what a thread's building looks like, what you archived, which repos you took off the map.
+ * The threads themselves stay
+ * read-only: this file is the only thing Bot Crossing writes, anywhere.
  */
 const emptyState = () => ({
   version: STATE_VERSION,
@@ -33,6 +56,8 @@ const emptyState = () => ({
   ignored: [],
   plots: {},
   seen: {},
+  hiddenProjects: [],
+  viewedAt: {},
   settings: null,
   updatedAt: 0,
 })
@@ -42,7 +67,7 @@ const asArray = (v) => (Array.isArray(v) ? v : [])
 
 async function readState() {
   try {
-    const raw = JSON.parse(await fsp.readFile(STATE_FILE, 'utf8'))
+    const raw = migrate(JSON.parse(await fsp.readFile(STATE_FILE, 'utf8')))
     return {
       version: STATE_VERSION,
       archived: asArray(raw.archived),
@@ -53,6 +78,8 @@ async function readState() {
       ignored: asArray(raw.ignored),
       plots: asObject(raw.plots),
       seen: asObject(raw.seen),
+      hiddenProjects: asArray(raw.hiddenProjects).map(String).filter(Boolean),
+      viewedAt: asObject(raw.viewedAt),
       settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : null,
       updatedAt: Number(raw.updatedAt) || 0,
     }
@@ -62,10 +89,22 @@ async function readState() {
 }
 
 /**
- * One writer: the browser owns this file and PUTs it whole. `/api/archive` deliberately
- * does not touch it — if it did, the next save from a page holding older state would
- * silently drop every archive made since that page loaded.
+ * One writer: the browser owns this file and PUTs it whole. Nothing on the server writes it —
+ * if anything did, the next save from a page holding older state would silently drop every
+ * archive made since that page loaded.
  */
+/**
+ * Writes are serialised through one chain, and each gets its own temp file.
+ *
+ * Both halves matter and neither is theoretical. A shared `colony.json.tmp` means two saves
+ * landing together race on the rename and one throws ENOENT — a 500 the page has no idea what
+ * to do with, so the save is simply lost. And read-then-write is not atomic across an `await`,
+ * so without the chain two callers can both pass the version check below before either writes.
+ */
+let writeQueue = Promise.resolve()
+let tmpSeq = 0
+const serialise = (fn) => (writeQueue = writeQueue.then(fn, fn))
+
 async function writeState(next) {
   const state = {
     version: STATE_VERSION,
@@ -75,13 +114,20 @@ async function writeState(next) {
     ignored: asArray(next.ignored),
     plots: asObject(next.plots),
     seen: asObject(next.seen),
+    hiddenProjects: asArray(next.hiddenProjects).map(String).filter(Boolean),
+    viewedAt: asObject(next.viewedAt),
     settings: next.settings && typeof next.settings === 'object' ? next.settings : null,
     updatedAt: Date.now(),
   }
   await fsp.mkdir(DATA_DIR, { recursive: true })
-  const tmp = STATE_FILE + '.tmp'
-  await fsp.writeFile(tmp, JSON.stringify(state, null, 2))
-  await fsp.rename(tmp, STATE_FILE)
+  const tmp = `${STATE_FILE}.${process.pid}.${++tmpSeq}.tmp`
+  try {
+    await fsp.writeFile(tmp, JSON.stringify(state, null, 2))
+    await fsp.rename(tmp, STATE_FILE)
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
   return state
 }
 
@@ -89,6 +135,9 @@ async function writeState(next) {
 /**
  * Hand a `harness://…` deep link, or a folder, to whatever opens things on this OS. The
  * opener gets an argument list, never a shell string.
+ *
+ * Only `present()` calls this, and no harness knowledge ever reaches it: an adapter says what it
+ * wants opened and this decides how, which is the seam that keeps `server/harnesses/` swappable.
  *
  * macOS's `open(1)` does both jobs, and `xdg-open` is the Linux equivalent. On Windows the
  * equivalent is ShellExecute, reached through `rundll32 url.dll,FileProtocolHandler`: a
@@ -132,11 +181,68 @@ async function resolveFolder(folder) {
 }
 
 /**
- * A harness loads its session records at launch and rewrites them whenever it touches one,
- * which silently clears an archive flag set from outside. So the colony keeps its own list
- * and re-asserts the flag on every scan; an archive that gets stomped comes back within one
- * poll. `archivePending` is true while the flag is on disk but the running app has not read
- * it yet — that astronaut is walking to the ship but has not boarded.
+ * Show a harness's answer to "open this" — `{ ok, url, command }` — and say truthfully whether
+ * anything happened.
+ *
+ * macOS and Windows hand the URL to the opener exactly as before: a scheme the harness's app
+ * registers is always answered there, so nothing is probed. Linux is the platform where the URL
+ * may have nowhere to go — the desktop app is optional and often absent, and `xdg-open` on a
+ * scheme nobody claims exits quietly, which used to reach the page as "Opened". So there the
+ * scheme is checked first; failing that, the harness's own CLI runs in a terminal, from the
+ * `command` the adapter offered alongside the URL; failing that, the page is told so.
+ *
+ * `command.cwd` came from the page — inside `ref`, or as the folder itself — so it gets the same
+ * check as any other folder the page names. There is no fallback directory on purpose:
+ * `claude --resume` looks a session up under the folder it ran in, and a terminal that opens on
+ * "No conversation found" and closes is worse than an error toast.
+ */
+async function present(result) {
+  // Only the reason reaches the page: a failure may still carry the adapter's command.
+  if (!result || !result.ok) return { ok: false, error: result?.error || 'Nothing to open' }
+
+  if (process.platform !== 'linux') {
+    if (!result.url) return { ok: false, error: 'That harness has no deep link to open on this platform' }
+    launch(result.url)
+    return { ok: true, url: result.url }
+  }
+
+  if (result.url && (await schemeHasHandler(result.url))) {
+    launch(result.url)
+    return { ok: true, url: result.url }
+  }
+  if (result.command) {
+    if (!result.command.cwd) return { ok: false, error: 'That thread has no folder on record to resume in' }
+    const cwd = await resolveFolder(result.command.cwd)
+    if (!cwd) return { ok: false, error: 'The folder that thread ran in is not on this machine any more' }
+    // A folder that exists but cannot be entered fails inside every terminal alike, and the
+    // terminal gets the blame; say what is actually wrong instead.
+    const enterable = await fsp.access(cwd, fsp.constants.X_OK).then(() => true, () => false)
+    if (!enterable) return { ok: false, error: 'The folder that thread ran in cannot be entered' }
+    return openInTerminal(result.command.argv, cwd)
+  }
+  const scheme = schemeOf(result.url)
+  return {
+    ok: false,
+    error: scheme
+      ? `Nothing on this machine opens ${scheme}:// links, and there is no CLI command to run instead`
+      : 'Nothing on this machine can open that',
+  }
+}
+
+/**
+ * Mark the threads the colony has retired.
+ *
+ * Nothing is written anywhere. Bot Crossing used to set `isArchived` on the desktop app's own
+ * session record, and it did land on disk — but the app serves from the copy it loaded at
+ * launch, so the thread stayed put in its own list until the next restart, and the app would
+ * rewrite the record from memory whenever it touched the thread. Papering over that took a
+ * re-assert on every poll, a `ps` sweep to guess whether the app had re-read the file, and a
+ * *pending* state for the gap between the two — a lot of machinery for something that still
+ * looked broken to anyone with the app open.
+ *
+ * So the colony keeps its own list and that is all it does. Archiving in the harness's own UI
+ * still sends the astronaut home, because the scan reads that flag; archiving here is the
+ * colony's own business. Nothing outside `data/colony.json` is ever written.
  */
 /**
  * How much later than the archive itself a write has to be before it counts as the thread
@@ -150,64 +256,56 @@ async function reconcileArchived(threads) {
   if (!state.archived.length) return threads
   const wanted = new Set(state.archived)
 
-  // One `ps` sweep per harness rather than one per thread.
-  const startedAt = new Map()
-  for (const id of new Set(threads.map((t) => t.harness))) {
-    startedAt.set(id, await harnessAppStartedAt(id))
-  }
-
   /**
-   * An archive is remembered by the thread id the page saw, but that id is only the
-   * *canonical* one: a thread keyed by a desktop record today can be keyed by its
-   * transcript tomorrow, once the CLI writes one. Matching on the ids inside `ref` as well
-   * means an archive survives that hand-over instead of the thread quietly reappearing
-   * under its new name.
+   * An archive is remembered by the thread id the page saw, but that id is only the *canonical*
+   * one. A thread the desktop app knows and the CLI has not written a transcript for is keyed on
+   * its desktop record; the moment a transcript appears it re-keys to that session's UUID, and a
+   * list keyed on the old string stops matching. The thread quietly comes back, which reads as
+   * the archive having failed.
+   *
+   * So the ids inside `ref` count too. They are opaque to everything else here — this only ever
+   * asks whether a string it already holds appears among them.
    */
-  const isArchived = (thread) => {
-    // A worker's `ref` is empty by design, so there is nothing to re-assert on disk for it.
-    if (thread.subagent) return wanted.has(thread.id)
+  const archived = (thread) => {
     if (wanted.has(thread.id)) return true
-    const ref = thread.ref || {}
-    if (ref.cliSessionId && wanted.has(ref.cliSessionId)) return true
-    return (ref.desktopSessionIds || []).some((id) => wanted.has(id))
+    const ref = thread.ref
+    if (!ref || typeof ref !== 'object') return false
+    for (const value of Object.values(ref)) {
+      if (typeof value === 'string') {
+        if (value && wanted.has(value)) return true
+      } else if (Array.isArray(value)) {
+        for (const v of value) if (typeof v === 'string' && v && wanted.has(v)) return true
+      }
+    }
+    return false
   }
 
-  const reconciled = await Promise.all(
-    threads.map(async (thread) => {
-      if (!isArchived(thread)) return thread
-      if (!thread.archived && thread.canArchive) {
-        await setThreadArchived(thread.harness, thread.ref, true).catch(() => {})
-      }
-      const ids = [thread.id, thread.ref?.cliSessionId, ...(thread.ref?.desktopSessionIds || [])]
-      const at = Math.max(0, ...ids.map((id) => (id && state.archivedAt[id]) || 0))
+  const reconciled = threads.map((thread) => {
+    if (!archived(thread)) return thread
+    const ids = [thread.id, thread.ref?.cliSessionId, ...(thread.ref?.desktopSessionIds || [])]
+    const at = Math.max(0, ...ids.map((id) => (id && state.archivedAt[id]) || 0))
 
-      /**
-       * A thread that has been worked on since you archived it is not archived any more.
-       *
-       * Archiving says "I am done with this". Going back to the session says the opposite,
-       * and it is the more recent of the two — so the flag comes off rather than the colony
-       * arguing with the harness about a thread you are visibly using. The page owns the
-       * list, so it is told through `unarchivedByActivity` rather than written to here.
-       */
-      if (at && thread.lastActivityAt > at + REVIVE_GRACE_MS) {
-        if (thread.archived && thread.canArchive) {
-          await setThreadArchived(thread.harness, thread.ref, false).catch(() => {})
-        }
-        return { ...thread, archived: false, unarchivedByActivity: true }
-      }
-
-      const appStart = startedAt.get(thread.harness) || 0
-      return { ...thread, archived: true, archivePending: !(appStart && appStart > at) }
-    })
-  )
+    /**
+     * A thread that has been worked on since you archived it is not archived any more.
+     *
+     * Archiving says "I am done with this". Going back to the session says the opposite, and
+     * it is the more recent of the two — so the flag comes off rather than the colony arguing
+     * with the harness about a thread you are visibly using. The page owns the list, so it is
+     * told through `unarchivedByActivity` rather than written to here.
+     */
+    if (at && thread.lastActivityAt > at + REVIVE_GRACE_MS) {
+      return { ...thread, archived: false, unarchivedByActivity: true }
+    }
+    return { ...thread, archived: true }
+  })
 
   /**
    * A worker goes with the thread that spawned it.
    *
-   * Its own archive flag can never be set — there is no record to write and no button to
-   * press — so without this an archived thread leaves its workers behind: a zone holding
-   * nothing but orphans, none of which can be retired or lead anywhere. Archiving the parent
-   * is the one gesture that retires them, which is exactly what it should mean.
+   * Its own archive flag can never be set — there is no record to write and no button to press
+   * — so without this an archived thread leaves its workers behind: a zone holding nothing but
+   * orphans, none of which can be retired or lead anywhere. Archiving the parent is the one
+   * gesture that retires them, which is exactly what it should mean.
    */
   const gone = new Set(reconciled.filter((t) => t.archived).map((t) => t.id))
   return reconciled.map((t) => (t.subagent && !t.archived && gone.has(t.parentId) ? { ...t, archived: true } : t))
@@ -307,7 +405,10 @@ export async function apiMiddleware(req, res, next) {
   try {
     if (url.pathname === '/api/threads' && req.method === 'GET') {
       const threads = await reconcileArchived(await scanThreads())
-      return send(res, 200, { threads, scannedAt: Date.now() })
+      // A harness that is present but cannot read its own store says so here, rather than
+      // appearing healthy in the list while quietly contributing nothing.
+      const warnings = (await harnessStatus()).filter((h) => h.detected && h.error).map((h) => h.error)
+      return send(res, 200, { threads, scannedAt: Date.now(), warnings })
     }
 
     if (url.pathname === '/api/usage' && req.method === 'GET') {
@@ -322,15 +423,37 @@ export async function apiMiddleware(req, res, next) {
       return send(res, 200, await readState())
     }
 
+    /**
+     * Optimistic concurrency, so a second tab cannot paste over the first one's work.
+     *
+     * `baseUpdatedAt` is the version the caller last agreed with. If the file no longer carries
+     * it, the caller's whole-file body describes a colony that no longer exists — so the disk
+     * state comes back with a 409 and the page merges against it. Merging here was the other
+     * option and it is the wrong place: the server has no idea which of two `plots` layouts a
+     * person actually dragged.
+     *
+     * The test is inequality rather than "older than", because a colony file also moves
+     * *backwards* — restored from a backup, edited by hand — and a page open across that holds
+     * a base newer than disk, which sails through a greater-than check and pastes the
+     * pre-restore colony straight back.
+     *
+     * A missing or zero base is a first write and is allowed: nothing to lose on a fresh
+     * install, and it keeps the endpoint drivable from `curl`.
+     */
     if (url.pathname === '/api/state' && req.method === 'PUT') {
-      return send(res, 200, await writeState(await readJsonBody(req)))
+      const body = await readJsonBody(req)
+      const base = Number(body.baseUpdatedAt) || 0
+      return serialise(async () => {
+        const current = await readState()
+        if (base && current.updatedAt !== base) return send(res, 409, current)
+        return send(res, 200, await writeState(body))
+      })
     }
 
     if (url.pathname === '/api/open' && req.method === 'POST') {
       const { harness, ref } = await readJsonBody(req)
-      const result = harnessOpenThread(harness, ref)
-      if (result.ok) launch(result.url)
-      return send(res, result.ok ? 200 : 400, result)
+      const shown = await present(await harnessOpenThread(harness, ref))
+      return send(res, shown.ok ? 200 : 400, shown)
     }
 
     if ((url.pathname === '/api/new-session' || url.pathname === '/api/reveal') && req.method === 'POST') {
@@ -342,29 +465,8 @@ export async function apiMiddleware(req, res, next) {
         launch(dir)
         return send(res, 200, { ok: true })
       }
-      const result = harnessNewSession(harness || (await defaultHarness()), dir)
-      if (result.ok) launch(result.url)
-      return send(res, result.ok ? 200 : 400, result)
-    }
-
-    if (url.pathname === '/api/archive' && req.method === 'POST') {
-      const { id, harness, ref, archived } = await readJsonBody(req)
-      if (!id) return send(res, 400, { ok: false, error: 'Missing thread id' })
-
-      // Only the harness's own records are touched here — the page records the intent. A
-      // thread the harness has no record for is archived in the colony alone, which is a
-      // success rather than a failure: the astronaut goes home either way.
-      const records = ref?.desktopSessionIds?.length || 0
-      if (!ref || !harness || !records) {
-        return send(res, 200, {
-          ok: true,
-          archived: Boolean(archived),
-          harnessRecord: false,
-          note: 'Archived in the colony. That harness has no session record for this thread.',
-        })
-      }
-      const result = await setThreadArchived(harness, ref, archived)
-      return send(res, 200, { ...result, ok: true, archived: Boolean(archived), harnessRecord: result.ok })
+      const shown = await present(await harnessNewSession(harness || (await defaultHarness()), dir))
+      return send(res, shown.ok ? 200 : 400, shown)
     }
 
     return send(res, 404, { error: 'Unknown endpoint' })
