@@ -16,13 +16,14 @@ Written so they can be reapplied against a clean checkout without this session's
 | 06 | [Taking a repo off the map](06-ignoring-a-repo.md) | The ignore list, and where colony state is whitelisted |
 | 07 | [Helmets say which model](07-model-helmets.md) | Model family read off the transcript, tinted per family, one palette shared with the HUD |
 | 08 | [What is left of your limits](08-usage-limits.md) | Session and weekly windows merged per window from two local caches, with their age and source |
+| 09 | [A sidebar group is a zone](09-session-groups.md) | Desktop sidebar groups read out of the app's LevelDB; group beats repo when zoning |
 
 ## Apply order
 
-01 → 02 → 03 → 04 → 05 → 06, then 07 and 08 in any order. Each of the first six compiles and
+01 → 02 → 03 → 04 → 05 → 06, then 07, 08 and 09 in any order. Each of the first six compiles and
 runs on top of the last, and several bugs in the later specs only exist because of an earlier
 one — 04's `unread` regression comes from 04's own timestamp fix, 05's dead Archive button comes
-from 03's button work. 07 needs only 03; 08 stands alone.
+from 03's button work. 07 needs only 03; 08 stands alone; 09 needs 02, whose zone machinery it extends.
 
 ## Rules that came out of this work
 

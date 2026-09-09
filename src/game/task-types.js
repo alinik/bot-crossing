@@ -64,6 +64,20 @@ export function taskTypeOf(thread) {
   return { key: 'misc', label: 'misc' }
 }
 
+/** The value that appears most often, ties going to the first seen. */
+function commonest(values) {
+  const counts = new Map()
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1)
+  let best = ''
+  let bestCount = 0
+  for (const [value, n] of counts) {
+    if (n <= bestCount) continue
+    best = value
+    bestCount = n
+  }
+  return best
+}
+
 /**
  * Group threads into zones: one per project, except that a project over `splitAt` threads
  * becomes one zone per task type. `splitAt` of 0 means never split — every repo is one zone,
@@ -73,12 +87,38 @@ export function taskTypeOf(thread) {
  * does not merge back into its parent the moment one of its types thins out — the map is
  * only worth learning if it holds still.
  *
+ * A **group** — a folder you dragged threads into in the desktop sidebar — takes precedence
+ * over the repo. A repo is where a thread runs, which is a guess at what it is for; a group
+ * is you saying so, and it is the only field on a thread that anybody sat down and set. So
+ * grouped threads leave their repos and stand together on a hex named after the group,
+ * however many different checkouts they came from, and everything else zones by project as
+ * before. A group crowded past `splitAt` splits by task type exactly like a repo does.
+ *
+ * A group named after a repo **absorbs** it: threads in a repo whose name matches a group's
+ * take that group's zone even when they were never dragged into it. Naming a group after
+ * the thing it is about is the obvious thing to do, and without this the colony answers it
+ * with two hexes carrying the same plaque — the group, and the repo's leftovers — which
+ * reads as a duplicate rather than as a distinction.
+ *
  * @returns Map of zone key → { key, project, label, threads }, biggest first.
  */
 export function zonesFor(threads, splitAt = SPLIT_AT) {
+  // Group ids by group name, so a repo of the same name can find the group that swallows
+  // it. Two groups sharing a name is the user's business; the first one seen takes the repo.
+  const groupNamed = new Map()
+  for (const thread of threads) {
+    if (thread.groupId && thread.group && !groupNamed.has(thread.group)) {
+      groupNamed.set(thread.group, thread.groupId)
+    }
+  }
+
   const byProject = new Map()
   for (const thread of threads) {
-    const key = thread.project || 'unknown'
+    const project = thread.project || 'unknown'
+    // `group:` cannot collide with a folder name — a project key is a basename, and a
+    // colon is not in one.
+    const groupId = thread.groupId || groupNamed.get(project) || ''
+    const key = groupId ? `group:${groupId}` : project
     if (!byProject.has(key)) byProject.set(key, [])
     byProject.get(key).push(thread)
   }
@@ -90,9 +130,19 @@ export function zonesFor(threads, splitAt = SPLIT_AT) {
   const parentOf = new Map(threads.filter((t) => t.subagent && t.parentId).map((t) => [t.id, t.parentId]))
 
   const zones = new Map()
-  for (const [project, list] of byProject) {
+  for (const [scope, list] of byProject) {
+    // What the plaque says: a group is named by the person who made it, a project by its
+    // folder. The zone *key* stays the group id — a group can be renamed, its id cannot, and
+    // the layout remembers zones by key.
+    // Read off the threads rather than off the first one: an absorbed repo puts ungrouped
+    // threads in a group zone, and any of them can come first.
+    const label = list.find((t) => t.group)?.group || scope
+    // `project` is still a repo, even on a group zone that spans several: it is what the
+    // Ignore button ignores and what the new-thread toast names, and neither means anything
+    // said of a group. The repo most of the zone's threads came from is the honest answer.
+    const project = scope.startsWith('group:') ? commonest(list.map((t) => t.project).filter(Boolean)) || label : scope
     if (!splitAt || list.length <= splitAt) {
-      zones.set(project, { key: project, project, label: project, threads: list })
+      zones.set(scope, { key: scope, project, label, threads: list })
       continue
     }
     const typeById = new Map()
@@ -102,9 +152,9 @@ export function zonesFor(threads, splitAt = SPLIT_AT) {
       const type = (parent && typeById.get(parent)) || typeById.get(thread.id)
       // The separator never appears in a folder name or a skill name, so an unsplit
       // project can never collide with a split one's zone.
-      const key = `${project}›${type.key}`
+      const key = `${scope}›${type.key}`
       if (!zones.has(key)) {
-        zones.set(key, { key, project, label: `${project} › ${type.label}`, threads: [] })
+        zones.set(key, { key, project, label: `${label} › ${type.label}`, threads: [] })
       }
       zones.get(key).threads.push(thread)
     }

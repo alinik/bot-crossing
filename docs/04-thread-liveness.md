@@ -77,6 +77,31 @@ attempt tested `stop_reason === 'end_turn'` and left every finished worker hamme
 message *called* is the reliable half; the `stop_reason` check only guards the mid-tool-call
 case.
 
+### A parent waiting on its own worker is working
+
+The other half of the same rule. A thread that hands a job to a subagent stops writing to its
+own transcript at that point, and when the worker was launched in the background the parent's
+turn really does end there — an assistant message that called nothing, which `awaitingReply`
+reads as the turn coming back to you. It has not. The answer is being written one directory
+down, in the worker's transcript, and a `?` over the parent sends you to a thread with nothing
+to reply to.
+
+So a running worker keeps its parent running, in a second pass over the finalised threads:
+
+```js
+const working = new Set()
+for (const thread of threads) if (thread.subagent && thread.running) working.add(thread.parentId)
+for (const thread of threads) {
+  if (thread.subagent || !working.has(thread.id)) continue
+  thread.running = true
+  thread.unread = false
+}
+```
+
+`running` already outranks `unread` in `statusFor`, so clearing the flag changes no astronaut on
+its own — but the sidebar and the zone counts read `unread` directly, and a thread mid-fan-out
+is not one that moved on since you last looked.
+
 ### Why a worker never becomes `unread`
 
 Nobody replies to a worker — it simply stops. Setting `unread` on one would put a `?` over an

@@ -16,6 +16,7 @@ import os from 'node:os'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { exists, jsonLines, listDirs, listFiles, num, readHead, readTail } from '../lib/fsutil.mjs'
+import { readLocalStorage } from './leveldb.mjs'
 
 const execFileAsync = promisify(execFile)
 const HOME = os.homedir()
@@ -41,6 +42,14 @@ const DESKTOP_SESSIONS = path.join(desktopDataDir(), 'claude-code-sessions')
 const CLI_PROJECTS = path.join(HOME, '.claude', 'projects')
 /** One file per live CLI process: {pid, sessionId, cwd, ...}. Stale files outlive their pid. */
 const CLI_LIVE = path.join(HOME, '.claude', 'sessions')
+/**
+ * Where the desktop app's *web* local storage lives — the sidebar's own state, including the
+ * groups you drag threads into. Nothing about a group reaches the session records, so this
+ * LevelDB is the only copy there is; see `leveldb.mjs` for why reading it is best-effort.
+ */
+const DESKTOP_LOCAL_STORAGE = path.join(desktopDataDir(), 'Local Storage', 'leveldb')
+const GROUPS_ORIGIN = 'https://claude.ai'
+const GROUPS_KEY = 'LSS-persisted.dframe-group-scopes'
 
 const HEAD_BYTES = 192 * 1024
 
@@ -347,6 +356,66 @@ function toThread(t) {
   }
 }
 
+/**
+ * Which sidebar group each thread was dragged into, keyed by desktop session id.
+ *
+ * The stored value is one entry per account and organisation:
+ *
+ * ```json
+ * { "<account>/<org>": { "groups": [{ "id": "cg-…", "name": "Mehrito" }],
+ *                        "assignments": { "code:local_<sessionId>": "cg-…" } } }
+ * ```
+ *
+ * A group is a statement about which threads belong together that nothing else on disk
+ * makes, so it outranks the folder a session happens to have been started from — see
+ * `zonesFor`. Accounts are folded into one map: the colony draws whatever is on this
+ * machine, and a session id is unique across all of them anyway.
+ *
+ * Anything unreadable — a locked database mid-write, a format Chromium changed — yields an
+ * empty map, and every thread falls back to its project.
+ */
+const groupCache = { stamp: -1, groups: new Map() }
+async function scanSessionGroups() {
+  let stamp = 0
+  try {
+    for (const name of await fsp.readdir(DESKTOP_LOCAL_STORAGE)) {
+      if (!name.endsWith('.ldb') && !name.endsWith('.log')) continue
+      stamp = Math.max(stamp, (await fsp.stat(path.join(DESKTOP_LOCAL_STORAGE, name))).mtimeMs)
+    }
+  } catch {
+    return new Map()
+  }
+  // Parsing the whole store on every poll to read one key is waste; nothing in it can have
+  // changed while every file's timestamp held still.
+  if (stamp === groupCache.stamp) return groupCache.groups
+
+  const groups = new Map()
+  try {
+    const raw = await readLocalStorage(DESKTOP_LOCAL_STORAGE, GROUPS_ORIGIN, GROUPS_KEY)
+    // Stored through a persistence wrapper that puts the state under `value`; read either
+    // shape, so the map survives that wrapper going away.
+    const parsed = raw ? JSON.parse(raw) : null
+    const scopes = parsed?.value ?? parsed ?? {}
+    for (const scope of Object.values(scopes)) {
+      const named = new Map((scope?.groups || []).map((g) => [g?.id, g?.name]))
+      for (const [assigned, groupId] of Object.entries(scope?.assignments || {})) {
+        const name = named.get(groupId)
+        // `code:` is the sidebar's prefix for a Claude Code thread; other kinds of entry
+        // can be grouped too, and none of them is a thread this colony draws.
+        if (!name || !assigned.startsWith('code:')) continue
+        groups.set(assigned.slice('code:'.length), { id: groupId, name })
+      }
+    }
+  } catch {
+    groupCache.stamp = stamp
+    groupCache.groups = new Map()
+    return groupCache.groups
+  }
+  groupCache.stamp = stamp
+  groupCache.groups = groups
+  return groups
+}
+
 async function scanThreads() {
   const [desktop, transcripts, live] = await Promise.all([
     scanDesktopSessions(),
@@ -354,6 +423,7 @@ async function scanThreads() {
     scanLiveSessions(),
   ])
   const subagents = await scanSubagentTranscripts()
+  const groups = await scanSessionGroups()
   const byId = new Map()
   const add = (thread) => {
     const existing = byId.get(thread.id)
@@ -507,10 +577,25 @@ async function scanThreads() {
    * broken in two. The parent knows better: the desktop record carries the repo it was opened
    * against, whatever directory the work wandered into.
    */
+  // The group a thread was dragged into, if any. A resumed conversation has more than one
+  // record and the group is only ever on one of them, so every id is tried.
+  for (const thread of byId.values()) {
+    if (thread.subagent) continue
+    for (const id of thread.desktopSessionIds) {
+      const group = groups.get(id)
+      if (!group) continue
+      thread.group = group.name
+      thread.groupId = group.id
+      break
+    }
+  }
+
   for (const thread of byId.values()) {
     if (!thread.subagent) continue
     const parent = byId.get(thread.parentId)
     if (!parent) continue
+    thread.group = parent.group || ''
+    thread.groupId = parent.groupId || ''
     thread.project = parent.project
     thread.projectPath = parent.projectPath
     thread.worktree = parent.worktree
@@ -559,6 +644,27 @@ async function scanThreads() {
     // seen it — which is the only way a terminal-only thread can ask for anything at all.
     // A subagent cannot: nobody replies to a worker, it simply stops.
     if (waiting && !thread.subagent) thread.unread = true
+  }
+  /**
+   * A thread waiting on its own worker is working, not waiting on you.
+   *
+   * The parent's transcript stops at the point it handed out the job, and for a worker
+   * launched in the background the turn genuinely ends there — an assistant message that
+   * called nothing, which is exactly what `awaitingReply` reads as the turn coming back to
+   * you. It has not: the answer it is waiting for is being written in the worker's
+   * transcript, one directory down, and putting a `?` over the parent sends you to a thread
+   * with nothing to reply to.
+   *
+   * So a running worker keeps its parent running. `running` outranks `unread` in `statusFor`
+   * either way, but the flag is cleared as well — the sidebar and the counts read it, and a
+   * thread mid-fan-out is not one that moved on since you last looked.
+   */
+  const working = new Set()
+  for (const thread of threads) if (thread.subagent && thread.running) working.add(thread.parentId)
+  for (const thread of threads) {
+    if (thread.subagent || !working.has(thread.id)) continue
+    thread.running = true
+    thread.unread = false
   }
   return threads.map(toThread)
 }

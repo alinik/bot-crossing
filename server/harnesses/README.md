@@ -144,9 +144,11 @@ in the world rather than in the scan.
 | `createdAt` | number | Epoch ms |
 | `lastActivityAt` | number | Epoch ms. Sorts the colony and decides dormancy — see the idle window under **Who shows up** |
 | `lastFocusedAt` | number | Epoch ms, `0` if unknowable |
-| `running` | boolean | Working **right now** — the astronaut hammers away. A live process is not enough: a session sitting at its prompt is not running, so check that the thread is mid-turn |
-| `unread` | boolean | Wants you — moved on since you last looked, or handed the turn back and is waiting on a reply. The astronaut stops and holds a `?` |
+| `running` | boolean | Working **right now** — the astronaut hammers away. A live process is not enough: a session sitting at its prompt is not running, so check that the thread is mid-turn. A thread whose own subagent is running counts as running: it is waiting on the worker, not on you |
+| `unread` | boolean | Wants you — moved on since you last looked, or handed the turn back and is waiting on a reply. The astronaut stops and holds a `?`. Never set it on a thread with a running subagent, and never on a worker |
 | `hasError` | boolean | Errored — the astronaut slumps, red eyes |
+| `group` | string | Optional. A group the user put this thread in, if the harness has such a thing. It outranks `project` when zoning — a group is deliberate, a working directory is not |
+| `groupId` | string | Optional, required with `group`. The group's stable key: zones are remembered by it, so a renamed group keeps its place |
 | `subagent` | boolean | This thread is a worker its parent spawned. Drawn in a yellow suit, on the parent's zone, and never openable or archivable |
 | `parentId` | string | The thread that spawned it, when `subagent` is set. Give a subagent its **parent's** `project`/`projectPath`, not its own working directory's — a worker usually runs in a worktree or a scratch folder |
 | `parentRef` | object | Opaque ref for the *parent*, when `subagent` is set: opening a worker opens the thread that spawned it. Keep it apart from `ref`, and leave a worker's own `ref` empty — a worker is never archivable, and pointing `ref` at the parent would archive a live thread from a click on one of its workers |
